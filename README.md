@@ -13,7 +13,41 @@
    - `OPENAI_API_KEY`：可选。填了会用 AI 润色和综合判断；不填也会生成规则版报告。
 5. 进入 `Actions`，启用工作流。
 
-默认每天北京时间 08:00 推送一次，也可以在 GitHub Actions 页面手动运行。
+本项目交给 cron-job.org 定时触发，电脑、Codex、浏览器都不用在线。GitHub Actions 页面也可以手动运行，运行时选择：
+
+- `daily`：生成每日黄金24小时判断报告，并保存当天报告和行情快照。
+- `weekly`：生成每周复盘报告，统计本周预测和真实金价之间的差距。
+
+## cron-job.org 配置
+
+日报任务：
+
+- 时间：每天北京时间 09:00
+- URL：`https://api.github.com/repos/thunderwong46/gold-wechat-actions/actions/workflows/daily-gold-report.yml/dispatches`
+- Method：`POST`
+- Body：
+
+```json
+{"ref":"main","inputs":{"mode":"daily"}}
+```
+
+周报复盘任务：
+
+- 时间：每周六北京时间 20:00
+- URL：同上
+- Method：`POST`
+- Body：
+
+```json
+{"ref":"main","inputs":{"mode":"weekly"}}
+```
+
+两个任务使用同一组 Headers：
+
+- `Authorization`：`Bearer 你的 GitHub Token`
+- `Accept`：`application/vnd.github+json`
+- `Content-Type`：`application/json`
+- `X-GitHub-Api-Version`：`2022-11-28`
 
 ## 报告结构
 
@@ -28,10 +62,21 @@
 
 ## 说明
 
-- GitHub Actions 的定时任务使用 UTC 时间，所以工作流里写的是 `0 0 * * *`，对应北京时间每天 08:00。
+- 定时由 cron-job.org 控制；GitHub Actions 只负责接到请求后生成报告、推送微信、保存归档。
 - 报告会先读取最新金价，并在正文里显示“金价更新时间”。
 - 最新金价优先级：Twelve Data 的 XAU/USD 5分钟级行情；其次是 Yahoo Finance 的黄金期货/现货行情。
 - 如果金价不是 90 分钟内更新的数据，报告会自动降低信心，并提示先观望，不给进场建议。
 - 报告还会尝试读取美元指数、美国10年期收益率和近24小时新闻。
 - 数据源可能出现限流或短时不可用。脚本会在报告里标注缺失数据，并降低信心。
 - 本报告是市场信息整理和情景推演，不构成个性化投资建议。
+
+## 历史归档
+
+每次工作流运行后，会自动保存两类文件：
+
+- `reports/YYYY/YYYY-MM-DD.md`：当天推送给微信的完整报告，方便直接阅读。
+- `data/YYYY/YYYY-MM-DD.json`：当天报告对应的行情快照、判断结论、关键价位、新闻线索，以及后续回填的24小时真实金价。
+- `reviews/YYYY/YYYY-MM-DD.md`：每周六推送的复盘报告。
+- `reviews/YYYY/YYYY-MM-DD.json`：每周复盘的结构化数据，方便以后继续统计。
+
+日报每次运行时，会自动检查之前还没复盘的报告。如果报告已经发布约24小时，就抓取最新金价，写入 `outcome_24h`。周报会读取本周数据，比较预测方向和真实变化，统计判断准确率。
