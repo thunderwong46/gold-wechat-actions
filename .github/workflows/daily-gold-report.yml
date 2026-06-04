@@ -35,6 +35,69 @@ jobs:
           REPORT_MODE: ${{ github.event.inputs.mode || 'daily' }}
         run: python scripts/gold_report.py
 
+      - name: Send email copy
+        env:
+          REPORT_MODE: ${{ github.event.inputs.mode || 'daily' }}
+          EMAIL_TO: thunderwong46@gmail.com
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_FROM: ${{ secrets.SMTP_FROM }}
+          SMTP_SECURITY: ${{ secrets.SMTP_SECURITY }}
+        run: |
+          python - <<'PY'
+          import os
+          import smtplib
+          from datetime import datetime
+          from email.message import EmailMessage
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+
+          host = os.getenv("SMTP_HOST")
+          username = os.getenv("SMTP_USERNAME")
+          password = os.getenv("SMTP_PASSWORD")
+          recipient = os.getenv("EMAIL_TO", "thunderwong46@gmail.com")
+          if not host or not username or not password or not recipient:
+              print("Email skipped: missing SMTP_HOST, SMTP_USERNAME, SMTP_PASSWORD, or EMAIL_TO.")
+              raise SystemExit(0)
+
+          now = datetime.now(ZoneInfo("Asia/Shanghai"))
+          date_key = now.strftime("%Y-%m-%d")
+          year = now.strftime("%Y")
+          mode = (os.getenv("REPORT_MODE") or "daily").strip().lower()
+          if mode == "weekly":
+              subject = "每周黄金报告复盘"
+              report_path = Path("reviews") / year / f"{date_key}.md"
+          else:
+              subject = "每日黄金24小时交易判断"
+              report_path = Path("reports") / year / f"{date_key}.md"
+
+          if not report_path.exists():
+              print(f"Email skipped: report file not found: {report_path}")
+              raise SystemExit(0)
+
+          message = EmailMessage()
+          message["Subject"] = subject
+          message["From"] = os.getenv("SMTP_FROM") or username
+          message["To"] = recipient
+          message.set_content(report_path.read_text(encoding="utf-8"))
+
+          port = int(os.getenv("SMTP_PORT") or "465")
+          security = (os.getenv("SMTP_SECURITY") or "ssl").strip().lower()
+          if security == "ssl":
+              with smtplib.SMTP_SSL(host, port, timeout=20) as smtp:
+                  smtp.login(username, password)
+                  smtp.send_message(message)
+          else:
+              with smtplib.SMTP(host, port, timeout=20) as smtp:
+                  if security in {"starttls", "tls"}:
+                      smtp.starttls()
+                  smtp.login(username, password)
+                  smtp.send_message(message)
+          print(f"Email sent to {recipient}: {report_path}")
+          PY
+
       - name: Commit report archive
         if: always()
         run: |
