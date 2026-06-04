@@ -11,12 +11,18 @@
    - `SERVERCHAN_SENDKEY`：你的 Server酱 SendKey。
    - `TWELVE_DATA_API_KEY`：推荐。用于抓取 XAU/USD 现货黄金 5分钟级最新行情。可在 Twelve Data 注册免费 key。
    - `OPENAI_API_KEY`：可选。填了会用 AI 润色和综合判断；不填也会生成规则版报告。
+   - `SMTP_HOST`：发件邮箱的 SMTP 服务器，例如 Gmail 可用 `smtp.gmail.com`。
+   - `SMTP_PORT`：SMTP 端口，常见为 `465`。
+   - `SMTP_USERNAME`：发件邮箱账号。
+   - `SMTP_PASSWORD`：发件邮箱的 SMTP 密码或应用专用密码。
+   - `SMTP_FROM`：可选。发件人地址；不填则默认使用 `SMTP_USERNAME`。
+   - `SMTP_SECURITY`：可选。默认 `ssl`；如果你的邮箱服务使用 587 端口，可填 `starttls`。
 5. 进入 `Actions`，启用工作流。
 
 本项目交给 cron-job.org 定时触发，电脑、Codex、浏览器都不用在线。GitHub Actions 页面也可以手动运行，运行时选择：
 
-- `daily`：生成每日黄金24小时判断报告，并保存当天报告和行情快照。
-- `weekly`：生成每周复盘报告，统计本周预测和真实金价之间的差距。
+- `daily`：生成每日黄金24小时判断报告，推送微信，同时发送邮件到 `thunderwong46@gmail.com`，并保存当天报告和行情快照。
+- `weekly`：生成每周复盘报告，推送微信，同时发送邮件到 `thunderwong46@gmail.com`，统计本周预测和真实金价之间的差距。
 
 ## cron-job.org 配置
 
@@ -63,6 +69,7 @@
 ## 说明
 
 - 定时由 cron-job.org 控制；GitHub Actions 只负责接到请求后生成报告、推送微信、保存归档。
+- 日报和每周复盘都会同时发送到邮箱 `thunderwong46@gmail.com`。如果没有配置 SMTP 密钥，邮件会跳过，微信推送仍会继续。
 - 报告会先读取最新金价，并在正文里显示“金价更新时间”。
 - 最新金价优先级：Twelve Data 的 XAU/USD 5分钟级行情；其次是 Yahoo Finance 的黄金期货/现货行情。
 - 如果金价不是 90 分钟内更新的数据，报告会自动降低信心，并提示先观望，不给进场建议。
