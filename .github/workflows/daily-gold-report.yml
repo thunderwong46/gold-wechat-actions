@@ -1,7 +1,15 @@
-name: Daily Gold WeChat Report
+name: Gold WeChat Reports
 
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "daily or weekly"
+        required: false
+        default: "daily"
+
+permissions:
+  contents: write
 
 jobs:
   send-report:
@@ -24,4 +32,18 @@ jobs:
           SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
           TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          REPORT_MODE: ${{ github.event.inputs.mode || 'daily' }}
         run: python scripts/gold_report.py
+
+      - name: Commit report archive
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add reports data reviews
+          if git diff --cached --quiet; then
+            echo "No report archive changes to commit."
+          else
+            git commit -m "Archive gold report data"
+            git push
+          fi
