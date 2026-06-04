@@ -6,7 +6,8 @@ import os
 import urllib.parse
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
@@ -442,6 +443,302 @@ def send_serverchan(title: str, desp: str) -> None:
         raise RuntimeError(f"ServerChan failed: {data}")
 
 
+def quote_to_dict(quote: Quote) -> dict[str, object]:
+    return {
+        "name": quote.name,
+        "symbol": quote.symbol,
+        "value": quote.value,
+        "change_24h": quote.change_24h,
+        "high_24h": quote.high_24h,
+        "low_24h": quote.low_24h,
+        "source": quote.source,
+        "updated_at": quote.updated_at.isoformat() if quote.updated_at else None,
+        "error": quote.error,
+    }
+
+
+def archive_report(report: str, raw_report: str, gold: Quote, dxy: Quote, tnx: Quote, news: list[str]) -> None:
+    generated_at = now_cn()
+    date_key = generated_at.strftime("%Y-%m-%d")
+    year = generated_at.strftime("%Y")
+    report_path = Path("reports") / year / f"{date_key}.md"
+    data_path = Path("data") / year / f"{date_key}.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    data_path.parent.mkdir(parents=True, exist_ok=True)
+
+    headline, action, probs, reasons, confidence = judge(gold, dxy, tnx)
+    levels = build_levels(gold)
+    snapshot = {
+        "date": date_key,
+        "generated_at": generated_at.isoformat(),
+        "github_run_id": os.getenv("GITHUB_RUN_ID"),
+        "github_run_number": os.getenv("GITHUB_RUN_NUMBER"),
+        "prediction": {
+            "headline": headline,
+            "action": action,
+            "probabilities": probs,
+            "reasons": reasons,
+            "confidence": confidence,
+            "levels": levels,
+        },
+        "quotes": {
+            "gold": quote_to_dict(gold),
+            "dxy": quote_to_dict(dxy),
+            "us10y": quote_to_dict(tnx),
+        },
+        "news": news,
+        "raw_report": raw_report,
+        "final_report": report,
+    }
+
+    report_path.write_text(report + "\n", encoding="utf-8")
+    data_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"Archived report to {report_path} and {data_path}.")
+
+
+def load_daily_snapshots() -> list[tuple[Path, dict[str, object]]]:
+    snapshots: list[tuple[Path, dict[str, object]]] = []
+    for path in sorted(Path("data").glob("*/*.json")):
+        try:
+            snapshots.append((path, json.loads(path.read_text(encoding="utf-8"))))
+        except Exception as exc:
+            print(f"Skip broken snapshot {path}: {exc}")
+    return snapshots
+
+
+def parse_cn_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=CN_TZ)
+        return parsed.astimezone(CN_TZ)
+    except ValueError:
+        return None
+
+
+def update_pending_outcomes(current_gold: Quote | None = None) -> list[Path]:
+    updated_paths: list[Path] = []
+    fetched_gold = current_gold
+
+    for path, snapshot in load_daily_snapshots():
+        if snapshot.get("outcome_24h"):
+            continue
+
+        generated_at = parse_cn_datetime(snapshot.get("generated_at"))
+        if generated_at is None or now_cn() - generated_at < timedelta(hours=23):
+            continue
+
+        gold_snapshot = (snapshot.get("quotes") or {}).get("gold") or {}
+        start_value = gold_snapshot.get("value")
+        if not isinstance(start_value, (int, float)) or start_value <= 0:
+            continue
+
+        if fetched_gold is None:
+            fetched_gold = fetch_best_gold_quote()
+        if fetched_gold.value is None:
+            continue
+
+        change = fetched_gold.value - float(start_value)
+        pct_change = change / float(start_value) * 100
+        snapshot["outcome_24h"] = {
+            "checked_at": now_cn().isoformat(),
+            "target_after": (generated_at + timedelta(hours=24)).isoformat(),
+            "actual_gold": quote_to_dict(fetched_gold),
+            "start_gold_value": float(start_value),
+            "actual_gold_value": fetched_gold.value,
+            "change": change,
+            "pct_change": pct_change,
+            "note": "用复盘运行时抓到的最新金价近似记录报告发布后24小时的真实结果。",
+        }
+        path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        updated_paths.append(path)
+
+    if updated_paths:
+        print("Updated outcomes: " + ", ".join(str(path) for path in updated_paths))
+    return updated_paths
+
+
+def prediction_direction(snapshot: dict[str, object]) -> str:
+    prediction = snapshot.get("prediction") or {}
+    headline = str(prediction.get("headline") or "")
+    action = str(prediction.get("action") or "")
+    text = headline + " " + action
+    if "小涨" in text or "上涨" in text:
+        return "看涨"
+    if "小跌" in text or "不利于金价上涨" in text:
+        return "看跌"
+    return "观望"
+
+
+def actual_direction(pct_change: float | None) -> str:
+    if pct_change is None:
+        return "缺失"
+    if pct_change >= 0.3:
+        return "实际上涨"
+    if pct_change <= -0.3:
+        return "实际下跌"
+    return "实际变化不大"
+
+
+def accuracy_result(predicted: str, actual: str) -> str:
+    if actual == "缺失":
+        return "未统计"
+    if predicted == "看涨" and actual == "实际上涨":
+        return "命中"
+    if predicted == "看跌" and actual == "实际下跌":
+        return "命中"
+    if predicted == "观望" and actual == "实际变化不大":
+        return "命中"
+    if predicted == "观望":
+        return "观望但行情走出方向"
+    return "未命中"
+
+
+def weekly_review_range(today: datetime) -> tuple[datetime.date, datetime.date]:
+    end_date = today.date()
+    start_date = end_date - timedelta(days=6)
+    return start_date, end_date
+
+
+def build_weekly_review() -> tuple[str, dict[str, object]]:
+    today = now_cn()
+    start_date, end_date = weekly_review_range(today)
+    records = []
+
+    for _, snapshot in load_daily_snapshots():
+        date_text = snapshot.get("date")
+        if not isinstance(date_text, str):
+            continue
+        try:
+            record_date = datetime.strptime(date_text, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if start_date <= record_date <= end_date:
+            records.append(snapshot)
+
+    rows = []
+    counted = 0
+    hits = 0
+    abs_moves = []
+    misses = []
+
+    for snapshot in sorted(records, key=lambda item: str(item.get("date"))):
+        date_text = str(snapshot.get("date"))
+        predicted = prediction_direction(snapshot)
+        gold_snapshot = ((snapshot.get("quotes") or {}).get("gold") or {})
+        start_value = gold_snapshot.get("value")
+        outcome = snapshot.get("outcome_24h") or {}
+        actual_value = outcome.get("actual_gold_value")
+        pct_change = outcome.get("pct_change")
+        if isinstance(pct_change, (int, float)):
+            pct_value = float(pct_change)
+        else:
+            pct_value = None
+        actual = actual_direction(pct_value)
+        result = accuracy_result(predicted, actual)
+
+        if result != "未统计":
+            counted += 1
+            abs_moves.append(abs(pct_value or 0))
+            if result == "命中":
+                hits += 1
+            else:
+                misses.append(f"{date_text}：预测{predicted}，{actual}，差距 {fmt(pct_value)}%")
+
+        rows.append(
+            {
+                "date": date_text,
+                "predicted": predicted,
+                "start_value": start_value,
+                "actual_value": actual_value,
+                "pct_change": pct_value,
+                "actual": actual,
+                "result": result,
+            }
+        )
+
+    accuracy = hits / counted * 100 if counted else None
+    avg_abs_move = sum(abs_moves) / len(abs_moves) if abs_moves else None
+    row_text = "\n".join(
+        (
+            f"- {row['date']}：预测 {row['predicted']}；报告价 {fmt(row['start_value'])}；"
+            f"24小时后 {fmt(row['actual_value'])}；真实变化 {fmt(row['pct_change'])}%；结果 {row['result']}"
+        )
+        for row in rows
+    )
+    if not row_text:
+        row_text = "- 本周还没有可复盘的日报数据。"
+
+    if counted == 0:
+        summary = "本周可统计的数据还不够，先继续积累。"
+    elif accuracy is not None and accuracy >= 70:
+        summary = "本周判断整体不错，可以继续沿用当前的保守交易规则。"
+    elif accuracy is not None and accuracy >= 50:
+        summary = "本周判断有一定参考价值，但还需要降低仓位，尤其要注意没到计划价位不交易。"
+    else:
+        summary = "本周判断偏差较大，下周要更保守，宁愿少交易，也不要强行找机会。"
+
+    miss_text = "\n".join(f"- {item}" for item in misses[:5]) if misses else "- 暂无明显偏差，或数据不足。"
+    generated_at = today.strftime("%Y-%m-%d %H:%M CST")
+    review = f"""# 每周黄金报告复盘
+
+时间：{generated_at}
+复盘范围：{start_date} 至 {end_date}
+
+## 先看结果
+- 本周可统计报告数：{counted}
+- 判断命中数：{hits}
+- 判断准确率：{fmt(accuracy)}%
+- 平均真实波动：{fmt(avg_abs_move)}%
+- 一句话结论：{summary}
+
+## 每天对比
+{row_text}
+
+## 偏差在哪里
+{miss_text}
+
+## 下周怎么改
+- 如果准确率低于50%，下周日报默认更保守，少给交易机会。
+- 如果连续两天判断失败，第三天只给观察建议，不主动建议开仓。
+- 金价真实波动低于0.3%时，按“变化不大”处理，不强行判断涨跌。
+- 任何时候都先控制亏损，再考虑盈利。
+
+## 说明
+- 这里的准确率只衡量“未来24小时方向判断”是否接近真实走势。
+- 真实数据来自每日报告发布约24小时后抓取到的金价。
+- 复盘用于改进报告，不代表未来一定准确。
+""".strip()
+
+    payload = {
+        "generated_at": today.isoformat(),
+        "range": {"start": str(start_date), "end": str(end_date)},
+        "counted": counted,
+        "hits": hits,
+        "accuracy": accuracy,
+        "average_absolute_move_pct": avg_abs_move,
+        "rows": rows,
+        "misses": misses,
+        "review": review,
+    }
+    return sanitize_report(review), payload
+
+
+def archive_weekly_review(review: str, payload: dict[str, object]) -> None:
+    generated_at = now_cn()
+    date_key = generated_at.strftime("%Y-%m-%d")
+    year = generated_at.strftime("%Y")
+    md_path = Path("reviews") / year / f"{date_key}.md"
+    json_path = Path("reviews") / year / f"{date_key}.json"
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    md_path.write_text(review + "\n", encoding="utf-8")
+    json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"Archived weekly review to {md_path} and {json_path}.")
+
+
 def fetch_best_quote(symbol: str, name: str) -> Quote:
     quote = fetch_yahoo_chart(symbol, name, range_="1d", interval="5m")
     age = quote_age_minutes(quote)
@@ -470,7 +767,8 @@ def fetch_best_gold_quote() -> Quote:
     return quote
 
 
-def main() -> None:
+def run_daily() -> None:
+    update_pending_outcomes()
     gold = fetch_best_gold_quote()
 
     dxy = fetch_best_quote("DX-Y.NYB", "US Dollar Index")
@@ -479,8 +777,25 @@ def main() -> None:
 
     raw = rules_report(gold, dxy, tnx, news)
     report = sanitize_report(improve_with_openai(raw))
+    archive_report(report, raw, gold, dxy, tnx, news)
     send_serverchan("每日黄金24小时交易判断", report)
     print("Report sent through ServerChan.")
+
+
+def run_weekly() -> None:
+    update_pending_outcomes()
+    review, payload = build_weekly_review()
+    archive_weekly_review(review, payload)
+    send_serverchan("每周黄金报告复盘", review)
+    print("Weekly review sent through ServerChan.")
+
+
+def main() -> None:
+    mode = (os.getenv("REPORT_MODE") or "daily").strip().lower()
+    if mode == "weekly":
+        run_weekly()
+    else:
+        run_daily()
 
 
 if __name__ == "__main__":
