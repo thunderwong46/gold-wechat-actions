@@ -1,0 +1,51 @@
+{
+  "generated_at": "2026-06-06T20:00:30.432394+08:00",
+  "range": {
+    "start": "2026-05-31",
+    "end": "2026-06-06"
+  },
+  "counted": 1,
+  "hits": 0,
+  "accuracy": 0.0,
+  "average_absolute_move_pct": 2.943966022925566,
+  "rows": [
+    {
+      "date": "2026-06-05",
+      "predicted": "看涨",
+      "trade_grade": "旧版",
+      "direction_score": null,
+      "risk_score": null,
+      "start_value": 4461.52126,
+      "actual_value": 4330.17559,
+      "pct_change": -2.943966022925566,
+      "evening_pct_change": null,
+      "evening_headline": null,
+      "evening_direction_score": null,
+      "evening_risk_score": null,
+      "actual": "实际下跌",
+      "result": "未命中",
+      "risk_text": "未记录明显事件风险"
+    },
+    {
+      "date": "2026-06-06",
+      "predicted": "看涨",
+      "trade_grade": "旧版",
+      "direction_score": null,
+      "risk_score": null,
+      "start_value": 4330.17559,
+      "actual_value": null,
+      "pct_change": null,
+      "evening_pct_change": null,
+      "evening_headline": null,
+      "evening_direction_score": null,
+      "evening_risk_score": null,
+      "actual": "缺失",
+      "result": "未统计",
+      "risk_text": "未记录明显事件风险"
+    }
+  ],
+  "misses": [
+    "2026-06-05：预测看涨，实际下跌，差距 -2.94%"
+  ],
+  "review": "# 每周黄金报告复盘\n\n时间：2026-06-06 20:00 CST\n复盘范围：2026-05-31 至 2026-06-06\n\n## 先看结果\n- 本周可统计报告数：1\n- 判断命中数：0\n- 判断准确率：0.00%\n- 平均真实波动：2.94%\n- 一句话结论：本周判断偏差较大，下周要更保守，宁愿少交易，也不要强行找机会。\n\n## 每天对比\n- 2026-06-05：预测 看涨；报告价 4461.52；晚间变化 缺失%；24小时后 4330.18；真实变化 -2.94%；结果 未命中；交易等级 旧版；方向分 None；风险分 None；当日风险：未记录明显事件风险\n- 2026-06-06：预测 看涨；报告价 4330.18；晚间变化 缺失%；24小时后 缺失；真实变化 缺失%；结果 未统计；交易等级 旧版；方向分 None；风险分 None；当日风险：未记录明显事件风险\n\n## 偏差在哪里\n- 2026-06-05：预测看涨，实际下跌，差距 -2.94%\n\n## 下周怎么改\n- 如果准确率低于50%，下周日报默认更保守，少给交易机会。\n- 如果连续两天判断失败，第三天只给观察建议，不主动建议开仓。\n- 金价真实波动低于0.3%时，按“变化不大”处理，不强行判断涨跌。\n- 任何时候都先控制亏损，再考虑盈利。\n\n## 说明\n- 这里的准确率只衡量“未来24小时方向判断”是否接近真实走势。\n- 真实数据来自每日报告发布约24小时后抓取到的金价。\n- 复盘用于改进报告，不代表未来一定准确。"
+}
