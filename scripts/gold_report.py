@@ -73,6 +73,12 @@ class TradeDecision:
     driver_scores: list[DriverScore]
 
 
+@dataclass
+class MarketContext:
+    quotes: dict[str, Quote]
+    notes: list[str]
+
+
 def now_cn() -> datetime:
     report_at = (os.getenv("REPORT_AT") or "").strip()
     if report_at:
@@ -218,6 +224,50 @@ def fetch_treasury_10y() -> Quote:
         )
     except Exception as exc:
         return Quote(name="US 10Y Treasury Yield", symbol="10Y Treasury", value=None, change_24h=None, high_24h=None, low_24h=None, source=url, error=str(exc))
+
+
+def parse_fred_date(value: str) -> datetime:
+    return datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=CN_TZ)
+
+
+def fetch_fred_series(series_id: str, name: str) -> Quote:
+    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={urllib.parse.quote(series_id)}"
+    try:
+        resp = http_get(url, timeout=20)
+        resp.raise_for_status()
+        rows = list(csv.DictReader(io.StringIO(resp.text)))
+        points = []
+        for row in rows:
+            value_text = (row.get(series_id) or "").strip()
+            date_text = (row.get("observation_date") or "").strip()
+            if not value_text or value_text == "." or not date_text:
+                continue
+            try:
+                dt = parse_fred_date(date_text)
+                value = float(value_text)
+            except ValueError:
+                continue
+            if dt.date() <= now_cn().date():
+                points.append((dt, value))
+        points.sort(key=lambda item: item[0])
+        if not points:
+            raise ValueError("no valid FRED rows")
+
+        latest_dt, latest = points[-1]
+        prior = points[-2][1] if len(points) >= 2 else latest
+        recent = [value for _, value in points[-5:]]
+        return Quote(
+            name=name,
+            symbol=series_id,
+            value=latest,
+            change_24h=latest - prior,
+            high_24h=max(recent) if recent else None,
+            low_24h=min(recent) if recent else None,
+            source=f"FRED CSV ({series_id})",
+            updated_at=latest_dt,
+        )
+    except Exception as exc:
+        return Quote(name=name, symbol=series_id, value=None, change_24h=None, high_24h=None, low_24h=None, source=url, error=str(exc))
 
 
 def first_usable_quote(quotes: list[Quote], *, require_recent: bool = False) -> Quote:
@@ -372,6 +422,41 @@ def news_risk_flags(news: list[str]) -> list[str]:
     return flags
 
 
+def build_market_context(gold: Quote, dxy: Quote, tnx: Quote, gld: Quote | None) -> MarketContext:
+    quotes: dict[str, Quote] = {
+        "gold": gold,
+        "dxy": dxy,
+        "us10y": tnx,
+    }
+    if gld is not None:
+        quotes["gld"] = gld
+
+    extra_fetchers = {
+        "real_10y": lambda: fetch_fred_series("DFII10", "10Y Real Yield"),
+        "fred_usd": lambda: fetch_fred_series("DTWEXBGS", "Broad US Dollar Index"),
+        "fred_10y": lambda: fetch_fred_series("DGS10", "10Y Treasury Yield FRED"),
+        "vix": lambda: fetch_best_market_quote("^VIX", "VIX Volatility Index", twelvedata_symbols=["VIX"]),
+        "sp500": lambda: fetch_best_market_quote("^GSPC", "S&P 500", twelvedata_symbols=["SPX", "SPY"]),
+        "silver": lambda: fetch_best_market_quote("SI=F", "Silver Futures", twelvedata_symbols=["XAG/USD", "XAGUSD"]),
+    }
+    for key, fetcher in extra_fetchers.items():
+        try:
+            quotes[key] = fetcher()
+        except Exception as exc:
+            quotes[key] = Quote(key, key, None, None, None, None, "supplemental fetch", error=str(exc))
+
+    notes = []
+    usable_count = sum(1 for quote in quotes.values() if quote.value is not None)
+    notes.append(f"后台参考数据共 {len(quotes)} 项，可用 {usable_count} 项。")
+    if quotes.get("real_10y") and quotes["real_10y"].value is not None:
+        notes.append("已纳入实际利率，用来判断黄金中期压力。")
+    if quotes.get("vix") and quotes["vix"].value is not None:
+        notes.append("已纳入VIX，用来判断市场恐慌程度。")
+    if quotes.get("silver") and quotes["silver"].value is not None:
+        notes.append("已纳入白银，用来观察贵金属联动。")
+    return MarketContext(quotes=quotes, notes=notes)
+
+
 def pct(change: float | None, value: float | None) -> float | None:
     if change is None or value is None:
         return None
@@ -433,6 +518,7 @@ def build_driver_scores(
     tnx: Quote,
     news: list[str] | None = None,
     calendar_events: list[CalendarEvent] | None = None,
+    market_context: MarketContext | None = None,
 ) -> list[DriverScore]:
     news = news or []
     calendar_events = calendar_events or []
@@ -488,6 +574,55 @@ def build_driver_scores(
     else:
         rows.append(DriverScore("美债收益率", f"近24小时 {fmt(tnx.change_24h)}", "方向不明", 0, 0, "利率端暂时没有明显方向。"))
 
+    context_quotes = market_context.quotes if market_context else {}
+    real_10y = context_quotes.get("real_10y")
+    if real_10y and real_10y.value is not None:
+        if real_10y.change_24h is not None and real_10y.change_24h <= -0.04:
+            rows.append(DriverScore("实际利率", f"{fmt(real_10y.value)}，近一日 {fmt(real_10y.change_24h)}", "支持上涨", 2, 0, "实际利率下降时，黄金吸引力通常会提高。"))
+        elif real_10y.change_24h is not None and real_10y.change_24h >= 0.04:
+            rows.append(DriverScore("实际利率", f"{fmt(real_10y.value)}，近一日 +{fmt(real_10y.change_24h)}", "支持下跌", -2, 0, "实际利率上升时，黄金容易承压。"))
+        else:
+            rows.append(DriverScore("实际利率", f"{fmt(real_10y.value)}", "方向不明", 0, 0, "实际利率没有明显变化。"))
+    elif real_10y:
+        rows.append(DriverScore("实际利率", "缺失", "不能判断", 0, 1, "实际利率缺失时，中期判断信心下降。"))
+
+    gld = context_quotes.get("gld")
+    if gld and gld.value is not None:
+        gld_pct = pct(gld.change_24h, gld.value)
+        if gld_pct is not None and gld_pct >= 0.7:
+            rows.append(DriverScore("黄金ETF价格", f"GLD近24小时 +{fmt(gld_pct)}%", "支持上涨", 1, 0, "黄金ETF同步走强，说明资金情绪不差。"))
+        elif gld_pct is not None and gld_pct <= -0.7:
+            rows.append(DriverScore("黄金ETF价格", f"GLD近24小时 {fmt(gld_pct)}%", "支持下跌", -1, 0, "黄金ETF同步走弱，说明资金情绪偏弱。"))
+        else:
+            rows.append(DriverScore("黄金ETF价格", f"GLD近24小时 {fmt(gld_pct)}%", "方向不明", 0, 0, "黄金ETF没有给出强信号。"))
+
+    silver = context_quotes.get("silver")
+    if silver and silver.value is not None:
+        silver_pct = pct(silver.change_24h, silver.value)
+        if silver_pct is not None and silver_pct >= 1.0:
+            rows.append(DriverScore("白银联动", f"白银近24小时 +{fmt(silver_pct)}%", "支持上涨", 1, 0, "白银同步走强，贵金属板块情绪较好。"))
+        elif silver_pct is not None and silver_pct <= -1.0:
+            rows.append(DriverScore("白银联动", f"白银近24小时 {fmt(silver_pct)}%", "支持下跌", -1, 0, "白银同步走弱，贵金属板块情绪偏弱。"))
+        else:
+            rows.append(DriverScore("白银联动", f"白银近24小时 {fmt(silver_pct)}%", "方向不明", 0, 0, "白银没有给出明显联动信号。"))
+
+    vix = context_quotes.get("vix")
+    sp500 = context_quotes.get("sp500")
+    vix_pct = pct(vix.change_24h, vix.value) if vix else None
+    sp500_pct = pct(sp500.change_24h, sp500.value) if sp500 else None
+    if vix and vix.value is not None:
+        if (vix_pct is not None and vix_pct >= 5) or vix.value >= 25:
+            rows.append(DriverScore("市场恐慌", f"VIX {fmt(vix.value)}，近24小时 {fmt(vix_pct)}%", "避险支持上涨", 1, 1, "市场恐慌上升时，黄金可能获得避险买盘，但波动也会变大。"))
+        elif vix_pct is not None and vix_pct <= -5:
+            rows.append(DriverScore("市场恐慌", f"VIX {fmt(vix.value)}，近24小时 {fmt(vix_pct)}%", "风险降低", 0, -1, "恐慌回落，黄金的避险买盘可能减弱。"))
+        else:
+            rows.append(DriverScore("市场恐慌", f"VIX {fmt(vix.value)}", "影响不明显", 0, 0, "恐慌指数没有明显变化。"))
+    if sp500 and sp500.value is not None and sp500_pct is not None:
+        if sp500_pct <= -1.0:
+            rows.append(DriverScore("风险资产", f"标普500近24小时 {fmt(sp500_pct)}%", "避险支持上涨", 1, 1, "股市明显下跌时，黄金可能受避险需求支撑。"))
+        elif sp500_pct >= 1.0:
+            rows.append(DriverScore("风险资产", f"标普500近24小时 +{fmt(sp500_pct)}%", "避险需求减弱", 0, 0, "股市走强时，避险买盘可能下降。"))
+
     high_events = [event for event in calendar_events if event.importance == "高"]
     if high_events:
         names = "、".join(event.event for event in high_events[:3])
@@ -518,11 +653,12 @@ def judge(
     tnx: Quote,
     news: list[str] | None = None,
     calendar_events: list[CalendarEvent] | None = None,
+    market_context: MarketContext | None = None,
 ) -> TradeDecision:
     gold_age = quote_age_minutes(gold)
     news = news or []
     calendar_events = calendar_events or []
-    driver_scores = build_driver_scores(gold, dxy, tnx, news, calendar_events)
+    driver_scores = build_driver_scores(gold, dxy, tnx, news, calendar_events, market_context)
     direction_score = sum(item.direction_score for item in driver_scores)
     risk_score = sum(item.risk_score for item in driver_scores)
     reasons = [item.explanation for item in driver_scores if item.direction_score or item.risk_score]
@@ -685,13 +821,21 @@ def build_calendar_text(events: list[CalendarEvent]) -> str:
     return "\n".join(rows)
 
 
-def build_driver_scores_text(decision: TradeDecision) -> str:
+def build_driver_scores_text(decision: TradeDecision, *, max_rows: int = 5) -> str:
     rows = []
-    for item in decision.driver_scores:
+    ranked = sorted(
+        decision.driver_scores,
+        key=lambda item: (abs(item.direction_score) + item.risk_score, abs(item.direction_score)),
+        reverse=True,
+    )
+    for item in ranked[:max_rows]:
         sign = "+" if item.direction_score > 0 else ""
         rows.append(
             f"- {item.factor}：{item.observation}｜结论：{item.effect}｜方向分 {sign}{item.direction_score}｜风险分 {item.risk_score}｜说明：{item.explanation}"
         )
+    hidden_count = max(0, len(decision.driver_scores) - len(rows))
+    if hidden_count:
+        rows.append(f"- 另外还有 {hidden_count} 项后台数据已参与评分，完整记录会保存到每日归档。")
     return "\n".join(rows)
 
 
@@ -879,9 +1023,10 @@ def rules_report(
     gld: Quote | None,
     news: list[str],
     calendar_events: list[CalendarEvent],
+    market_context: MarketContext | None = None,
 ) -> str:
     levels = build_levels(gold)
-    decision = judge(gold, dxy, tnx, news, calendar_events)
+    decision = judge(gold, dxy, tnx, news, calendar_events, market_context)
     today = now_cn().strftime("%Y-%m-%d %H:%M CST")
 
     news_text = "\n".join(f"- {item}" for item in news[:5]) if news else "- 暂未抓到可靠的近24小时新闻标题，需降低新闻面判断权重。"
@@ -899,6 +1044,9 @@ def rules_report(
     core_logic = build_core_logic(decision)
     conclusion_table = build_conclusion_table(decision, core_logic)
     score_summary = build_score_summary(decision)
+    context_notes = "\n".join(f"- {note}" for note in (market_context.notes if market_context else []))
+    if not context_notes:
+        context_notes = "- 后台参考数据暂未扩展。"
 
     return f"""# 黄金日报：交易决策版
 
@@ -919,6 +1067,7 @@ def rules_report(
 
 ## 4. 驱动因素评分
 {score_summary}
+{context_notes}
 {driver_text}
 
 ## 5. 技术面，只保留关键价位
@@ -993,6 +1142,7 @@ def improve_with_openai(raw_report: str) -> str:
                         "报告必须保持10部分结构：今日结论、市场快照、宏观事件日历、驱动因素评分、技术面关键价位、分情景交易计划、风险控制、新闻风险、哪些情况不做、复盘模块。"
                         "不要新增大段栏目，不要改变栏目顺序。"
                         "必须保留交易等级A/B/C、方向分、风险分、买入观察价、止损价和目标价。"
+                        "驱动因素评分部分只展示最关键的5条，其余后台数据只说明已参与评分，不要全部展开。"
                         "避免使用震荡偏多、宽幅震荡、冲高回落、回踩、突破等交易黑话；必须用大白话解释。"
                         "把每个专业词都翻译成普通投资者能理解的话。句子要短，直接告诉用户今天该不该动手、为什么、错了怎么办。"
                         "必须强调风险控制，不能承诺盈利。输出中文 Markdown，但不要使用星号加粗。"
@@ -1058,6 +1208,7 @@ def archive_report(
     gld: Quote | None,
     news: list[str],
     calendar_events: list[CalendarEvent],
+    market_context: MarketContext | None = None,
 ) -> None:
     generated_at = now_cn()
     date_key = generated_at.strftime("%Y-%m-%d")
@@ -1067,7 +1218,7 @@ def archive_report(
     report_path.parent.mkdir(parents=True, exist_ok=True)
     data_path.parent.mkdir(parents=True, exist_ok=True)
 
-    decision = judge(gold, dxy, tnx, news, calendar_events)
+    decision = judge(gold, dxy, tnx, news, calendar_events, market_context)
     levels = build_levels(gold)
     snapshot = {
         "date": date_key,
@@ -1102,6 +1253,13 @@ def archive_report(
             "dxy": quote_to_dict(dxy),
             "us10y": quote_to_dict(tnx),
             "gld": quote_to_dict(gld) if gld is not None else None,
+        },
+        "market_context": {
+            "notes": market_context.notes if market_context else [],
+            "quotes": {
+                key: quote_to_dict(value)
+                for key, value in (market_context.quotes if market_context else {}).items()
+            },
         },
         "news": news,
         "calendar_events": [calendar_to_dict(event) for event in calendar_events],
@@ -1454,12 +1612,13 @@ def run_daily() -> None:
     dxy = fetch_best_dxy_quote()
     tnx = fetch_best_tnx_quote()
     gld = fetch_best_gld_quote()
+    market_context = build_market_context(gold, dxy, tnx, gld)
     news = fetch_news()
     calendar_events = fetch_economic_calendar()
 
-    raw = rules_report(gold, dxy, tnx, gld, news, calendar_events)
+    raw = rules_report(gold, dxy, tnx, gld, news, calendar_events, market_context)
     report = sanitize_report(improve_with_openai(raw))
-    archive_report(report, raw, gold, dxy, tnx, gld, news, calendar_events)
+    archive_report(report, raw, gold, dxy, tnx, gld, news, calendar_events, market_context)
     send_serverchan("每日黄金24小时交易判断", report)
     print("Report sent through ServerChan.")
 
@@ -1507,6 +1666,64 @@ def run_test_daily() -> None:
         source="历史测试快照：昨天9点附近GLD黄金ETF",
         updated_at=updated_at,
     )
+    real_10y = Quote(
+        name="10Y Real Yield",
+        symbol="DFII10",
+        value=2.12,
+        change_24h=0.05,
+        high_24h=2.12,
+        low_24h=2.07,
+        source="模拟后台数据：10年期实际利率",
+        updated_at=updated_at,
+    )
+    vix = Quote(
+        name="VIX Volatility Index",
+        symbol="VIX",
+        value=18.60,
+        change_24h=2.20,
+        high_24h=19.40,
+        low_24h=16.50,
+        source="模拟后台数据：VIX",
+        updated_at=updated_at,
+    )
+    sp500 = Quote(
+        name="S&P 500",
+        symbol="SPX",
+        value=5825.40,
+        change_24h=-62.30,
+        high_24h=5890.20,
+        low_24h=5810.00,
+        source="模拟后台数据：标普500",
+        updated_at=updated_at,
+    )
+    silver = Quote(
+        name="Silver Futures",
+        symbol="XAG/USD",
+        value=31.25,
+        change_24h=-0.72,
+        high_24h=32.10,
+        low_24h=31.05,
+        source="模拟后台数据：白银",
+        updated_at=updated_at,
+    )
+    market_context = MarketContext(
+        quotes={
+            "gold": gold,
+            "dxy": dxy,
+            "us10y": tnx,
+            "gld": gld,
+            "real_10y": real_10y,
+            "vix": vix,
+            "sp500": sp500,
+            "silver": silver,
+        },
+        notes=[
+            "后台参考数据共 8 项，可用 8 项。",
+            "已纳入实际利率，用来判断黄金中期压力。",
+            "已纳入VIX，用来判断市场恐慌程度。",
+            "已纳入白银，用来观察贵金属联动。",
+        ],
+    )
     news = [
         "Gold slides as stronger U.S. jobs data lifts dollar and Treasury yields",
         "Treasury yields rise after labor market data reduces near-term rate-cut hopes",
@@ -1525,7 +1742,7 @@ def run_test_daily() -> None:
             importance="高",
         )
     ]
-    raw = rules_report(gold, dxy, tnx, gld, news, calendar_events)
+    raw = rules_report(gold, dxy, tnx, gld, news, calendar_events, market_context)
     raw = raw.replace("# 黄金日报：交易决策版", "# 黄金日报：交易决策版（历史测试）", 1)
     raw += "\n\n测试说明：这份报告使用昨天9点附近的历史测试快照，只用于查看正式报告长什么样；正式日报会抓取实时数据。"
     report = sanitize_report(improve_with_openai(raw))
