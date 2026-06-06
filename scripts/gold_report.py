@@ -809,20 +809,24 @@ def build_market_checklist(gold: Quote, dxy: Quote, tnx: Quote) -> list[str]:
 def build_calendar_text(events: list[CalendarEvent]) -> str:
     if not events:
         return "- 今天暂未抓到重要财经日历。"
-    rows = []
+    rows = [
+        "| 时间 | 事件 | 处理 |",
+        "| --- | --- | --- |",
+    ]
     for event in events[:8]:
         if event.event == "财经日历抓取失败":
-            rows.append("- 财经日历抓取失败：今天的事件风险需要手动留意。")
+            rows.append("| - | 财经日历抓取失败 | 手动留意事件风险 |")
             continue
         impact = "新手先观望" if event.importance == "高" else "留意即可"
-        rows.append(
-            f"- {event.time_text}｜{event.country}｜{event.event}｜重要性：{event.importance}｜处理：{impact}"
-        )
+        rows.append(f"| {event.time_text} | {event.country}｜{event.event}｜{event.importance} | {impact} |")
     return "\n".join(rows)
 
 
 def build_driver_scores_text(decision: TradeDecision, *, max_rows: int = 5) -> str:
-    rows = []
+    rows = [
+        "| 因素 | 结论 | 分数/解释 |",
+        "| --- | --- | --- |",
+    ]
     ranked = sorted(
         decision.driver_scores,
         key=lambda item: (abs(item.direction_score) + item.risk_score, abs(item.direction_score)),
@@ -830,12 +834,11 @@ def build_driver_scores_text(decision: TradeDecision, *, max_rows: int = 5) -> s
     )
     for item in ranked[:max_rows]:
         sign = "+" if item.direction_score > 0 else ""
-        rows.append(
-            f"- {item.factor}：{item.observation}｜结论：{item.effect}｜方向分 {sign}{item.direction_score}｜风险分 {item.risk_score}｜说明：{item.explanation}"
-        )
-    hidden_count = max(0, len(decision.driver_scores) - len(rows))
+        rows.append(f"| {item.factor} | {item.effect} | 方向{sign}{item.direction_score} / 风险{item.risk_score}；{item.explanation} |")
+    shown_rows = len(rows) - 2
+    hidden_count = max(0, len(decision.driver_scores) - shown_rows)
     if hidden_count:
-        rows.append(f"- 另外还有 {hidden_count} 项后台数据已参与评分，完整记录会保存到每日归档。")
+        rows.append(f"| 其他后台数据 | 已参与评分 | 另有 {hidden_count} 项，完整记录保存到每日归档 |")
     return "\n".join(rows)
 
 
@@ -893,23 +896,48 @@ def build_score_summary(decision: TradeDecision) -> str:
     else:
         risk_text = "风险暂时可控，但仍要止损"
 
-    return f"- 总方向分：{decision.direction_score}，{direction_text}。\n- 总风险分：{decision.risk_score}，{risk_text}。"
+    return "\n".join(
+        [
+            "| 项目 | 数值 | 含义 |",
+            "| --- | --- | --- |",
+            f"| 总方向分 | {decision.direction_score} | {direction_text} |",
+            f"| 总风险分 | {decision.risk_score} | {risk_text} |",
+        ]
+    )
+
+
+def build_context_notes_table(notes: list[str]) -> str:
+    rows = [
+        "| 后台数据 | 状态 |",
+        "| --- | --- |",
+    ]
+    if not notes:
+        rows.append("| 参考数据 | 暂未扩展 |")
+        return "\n".join(rows)
+    for idx, note in enumerate(notes[:4], start=1):
+        rows.append(f"| {idx} | {note} |")
+    if len(notes) > 4:
+        rows.append(f"| 其他 | 另有 {len(notes) - 4} 条说明已保存到归档 |")
+    return "\n".join(rows)
 
 
 def build_market_snapshot(gold: Quote, dxy: Quote, tnx: Quote, gld: Quote | None = None) -> str:
     gold_pct = pct(gold.change_24h, gold.value)
     dxy_pct = pct(dxy.change_24h, dxy.value)
-    gld_line = ""
+    rows = [
+        "| 指标 | 当前/变化 | 用途 |",
+        "| --- | --- | --- |",
+        f"| 国际黄金 | {fmt(gold.value)} 美元/盎司；24小时 {fmt(gold.change_24h)} 美元，约 {fmt(gold_pct)}% | 核心交易价格 |",
+        f"| 金价更新时间 | {fmt_time(gold.updated_at)} | 判断数据是否新 |",
+        f"| 美元指数 | {fmt(dxy.value)}；24小时 {fmt(dxy_pct)}% | 美元强通常压黄金 |",
+        f"| 美国10年期收益率 | {fmt(tnx.value)}；24小时 {fmt(tnx.change_24h)} | 利率上行通常压黄金 |",
+    ]
     if gld is not None:
         gld_pct = pct(gld.change_24h, gld.value)
-        gld_line = f"\n- GLD黄金ETF：{fmt(gld.value)}，近24小时 {fmt(gld_pct)}%，用于粗看海外黄金资金情绪"
-    lines = f"""- 国际黄金：{fmt(gold.value)} 美元/盎司，近24小时 {fmt(gold.change_24h)} 美元，约 {fmt(gold_pct)}%
-- 金价更新时间：{fmt_time(gold.updated_at)}
-- 美元指数：{fmt(dxy.value)}，近24小时 {fmt(dxy_pct)}%
-- 美国10年期收益率：{fmt(tnx.value)}，近24小时 {fmt(tnx.change_24h)}
-{gld_line}
-- 数据完整性：{"完整" if not any(q.value is None for q in [gold, dxy, tnx]) else "部分缺失，今天只适合降低仓位或观察"}""".strip()
-    return re.sub(r"\n{2,}", "\n", lines)
+        rows.append(f"| GLD黄金ETF | {fmt(gld.value)}；24小时 {fmt(gld_pct)}% | 海外黄金资金情绪 |")
+    data_quality = "完整" if not any(q.value is None for q in [gold, dxy, tnx]) else "部分缺失"
+    rows.append(f"| 数据完整性 | {data_quality} | 缺失时降低仓位和信心 |")
+    return "\n".join(rows)
 
 
 def build_trade_rules(decision: TradeDecision, levels: dict[str, str], gold: Quote) -> tuple[str, str, str]:
@@ -945,39 +973,82 @@ def build_trade_rules(decision: TradeDecision, levels: dict[str, str], gold: Quo
     )
 
 
+def build_levels_table(levels: dict[str, str]) -> str:
+    return "\n".join(
+        [
+            "| 价位 | 区间 | 怎么用 |",
+            "| --- | --- | --- |",
+            f"| 买入观察价 | {levels['support_near']} | 只观察是否止跌，不是到价就买 |",
+            f"| 认错位置 | {levels['support_key']} | 跌破说明判断错了，先退出 |",
+            f"| 第一目标 | {levels['resistance_near']} | 到了先减仓，不贪 |",
+            f"| 第二目标 | {levels['resistance_key']} | 强势才看这里 |",
+        ]
+    )
+
+
+def build_trade_plan_table(entry_rule: str, target_rule: str, stop_rule: str) -> str:
+    return "\n".join(
+        [
+            "| 项目 | 规则 |",
+            "| --- | --- |",
+            f"| 入场 | {entry_rule} |",
+            f"| 目标/减仓 | {target_rule} |",
+            f"| 止损/认错 | {stop_rule} |",
+        ]
+    )
+
+
+def build_probability_table(probabilities: dict[str, int]) -> str:
+    rows = [
+        "| 情况 | 概率 |",
+        "| --- | --- |",
+    ]
+    for label, value in probabilities.items():
+        rows.append(f"| {label} | {value}% |")
+    return "\n".join(rows)
+
+
 def build_trade_scenarios(decision: TradeDecision, levels: dict[str, str], gold: Quote) -> str:
     if gold.value is None or decision.trade_grade == "C":
         return "\n".join(
             [
-                "- 情景一：价格下跌到买入观察区。处理：先看，不急着买，等下一份报告或手动确认。",
-                "- 情景二：价格突然上涨。处理：不追高，因为没有计划内买点。",
-                "- 情景三：价格快速下跌。处理：不抄底，先保护本金。",
+                "| 情景 | 处理 |",
+                "| --- | --- |",
+                "| 价格下跌到买入观察区 | 先看，不急着买，等下一份报告或手动确认 |",
+                "| 价格突然上涨 | 不追高，因为没有计划内买点 |",
+                "| 价格快速下跌 | 不抄底，先保护本金 |",
             ]
         )
 
     if "上涨机会" in decision.headline:
         return "\n".join(
             [
-                f"- 情景一：价格回到 {levels['support_near']}，并且不再继续跌。处理：只用小仓位买入。",
-                f"- 情景二：价格直接涨到 {levels['resistance_near']} 附近。处理：没有持仓就不追；已有持仓先减一部分。",
-                f"- 情景三：价格跌破 {levels['support_key']}。处理：取消今天买入想法，已经买了就先离场。",
+                "| 情景 | 处理 |",
+                "| --- | --- |",
+                f"| 回到 {levels['support_near']} 且不再继续跌 | 小仓位买入 |",
+                f"| 直接涨到 {levels['resistance_near']} 附近 | 没持仓不追；有持仓先减一部分 |",
+                f"| 跌破 {levels['support_key']} | 取消买入想法，已买先离场 |",
             ]
         )
 
     if "下跌风险" in decision.headline:
         return "\n".join(
             [
-                f"- 情景一：价格跌破 {levels['support_near']}。处理：不买，已有多单先减仓或离场。",
-                f"- 情景二：价格重新涨回 {levels['resistance_near']} 上方，并且没有马上跌回。处理：说明下跌风险缓和，但仍先观察。",
-                f"- 情景三：价格在中间位置来回动。处理：不交易，因为没有便宜价，也没有强势信号。",
+                "| 情景 | 处理 |",
+                "| --- | --- |",
+                f"| 跌破 {levels['support_near']} | 不买，已有多单先减仓或离场 |",
+                f"| 重新涨回 {levels['resistance_near']} 上方 | 下跌风险缓和，但仍先观察 |",
+                "| 在中间位置来回动 | 不交易，没有便宜价也没有强势信号 |",
             ]
         )
 
     return "\n".join(
         [
-            f"- 情景一：价格跌到 {levels['support_near']} 并稳住。处理：最多小仓位试一次。",
-            f"- 情景二：价格涨到 {levels['resistance_near']}。处理：没有提前买就不追。",
-            f"- 情景三：价格跌破 {levels['support_key']}。处理：今天不再找买点。",
+            "| 情景 | 处理 |",
+            "| --- | --- |",
+            f"| 跌到 {levels['support_near']} 并稳住 | 最多小仓位试一次 |",
+            f"| 涨到 {levels['resistance_near']} | 没有提前买就不追 |",
+            f"| 跌破 {levels['support_key']} | 今天不再找买点 |",
         ]
     )
 
@@ -1016,6 +1087,16 @@ def build_no_trade_conditions(gold: Quote, events: list[CalendarEvent]) -> list[
     return rows
 
 
+def build_simple_table(title: str, rows: list[str]) -> str:
+    table = [
+        f"| {title} |",
+        "| --- |",
+    ]
+    for item in rows:
+        table.append(f"| {item} |")
+    return "\n".join(table)
+
+
 def rules_report(
     gold: Quote,
     dxy: Quote,
@@ -1030,23 +1111,32 @@ def rules_report(
     today = now_cn().strftime("%Y-%m-%d %H:%M CST")
 
     news_text = "\n".join(f"- {item}" for item in news[:5]) if news else "- 暂未抓到可靠的近24小时新闻标题，需降低新闻面判断权重。"
-    probs_text = "\n".join(f"- {k}：{v}%" for k, v in decision.probabilities.items())
+    probs_text = build_probability_table(decision.probabilities)
     reasons_text = "\n".join(f"- {reason}" for reason in decision.reasons) if decision.reasons else "- 当前没有单一变量给出强信号，按方向不清楚处理。"
     calendar_text = build_calendar_text(calendar_events)
     entry_rule, target_rule, stop_rule = build_trade_rules(decision, levels, gold)
+    levels_table = build_levels_table(levels)
+    trade_plan_table = build_trade_plan_table(entry_rule, target_rule, stop_rule)
     scenarios_text = build_trade_scenarios(decision, levels, gold)
     driver_text = build_driver_scores_text(decision)
     market_snapshot = build_market_snapshot(gold, dxy, tnx, gld)
-    no_trade_text = "\n".join(f"- {item}" for item in build_no_trade_conditions(gold, calendar_events))
-    loss_traps_text = "\n".join(f"- {item}" for item in build_loss_traps(decision, gold, calendar_events))
+    no_trade_text = build_simple_table("直接不做的情况", build_no_trade_conditions(gold, calendar_events))
+    loss_traps_text = build_simple_table("最容易亏钱的动作", build_loss_traps(decision, gold, calendar_events))
     risk_flags = news_risk_flags(news)
     news_risk_text = "、".join(risk_flags) if risk_flags else "暂未发现特别强的新闻风险词"
     core_logic = build_core_logic(decision)
     conclusion_table = build_conclusion_table(decision, core_logic)
     score_summary = build_score_summary(decision)
-    context_notes = "\n".join(f"- {note}" for note in (market_context.notes if market_context else []))
-    if not context_notes:
-        context_notes = "- 后台参考数据暂未扩展。"
+    context_notes = build_context_notes_table(market_context.notes if market_context else [])
+    risk_control_table = build_simple_table(
+        "风险控制",
+        [
+            "新手仓位：单笔最多只让账户亏损 0.5% 到 1%。",
+            "不加仓摊平亏损单；方向错了先退出。",
+            "数据前后30分钟波动会放大，新手不做追单。",
+            "报告目标是减少乱交易，不能保证每天盈利。",
+        ],
+    )
 
     return f"""# 黄金日报：交易决策版
 
@@ -1071,22 +1161,15 @@ def rules_report(
 {driver_text}
 
 ## 5. 技术面，只保留关键价位
-- 买入观察价：{levels["support_near"]}
-- 跌破就认错的位置：{levels["support_key"]}
-- 第一目标/减仓价：{levels["resistance_near"]}
-- 第二目标/减仓价：{levels["resistance_key"]}
+{levels_table}
 
 ## 6. 今日交易计划，必须分情景
-- 入场规则：{entry_rule}
-- 目标/减仓：{target_rule}
-- 止损/认错：{stop_rule}
+{trade_plan_table}
+
 {scenarios_text}
 
 ## 7. 风险控制模块
-- 新手仓位：单笔最多只让账户亏损 0.5% 到 1%。
-- 不加仓摊平亏损单；方向错了先退出。
-- 数据前后30分钟波动会放大，除非经验足够，否则不做追单。
-- 这份报告追求的是提高胜率和减少乱交易，不能保证每天盈利。
+{risk_control_table}
 
 ## 8. 新闻与地缘风险
 - 新闻风险归纳：{news_risk_text}
@@ -1099,14 +1182,18 @@ def rules_report(
 {loss_traps_text}
 
 ## 10. 复盘模块
-- 今天预测方向：{decision.headline}
-- 交易等级：{decision.trade_grade}
-- 方向分：{decision.direction_score}
-- 风险分：{decision.risk_score}
-- 24小时概率判断：
+| 项目 | 记录 |
+| --- | --- |
+| 预测方向 | {decision.headline} |
+| 交易等级 | {decision.trade_grade} |
+| 方向分 | {decision.direction_score} |
+| 风险分 | {decision.risk_score} |
+| 报告价 | {fmt(gold.value)} |
+
+24小时概率判断：
 {probs_text}
-- 报告价：{fmt(gold.value)}
-- 24小时后会记录真实金价，并在周六复盘里比较预测和实际变化。
+
+24小时后会记录真实金价，并在周六复盘里比较预测和实际变化。
 
 ## 判断依据补充
 {reasons_text}
@@ -1141,6 +1228,7 @@ def improve_with_openai(raw_report: str) -> str:
                         "只基于用户提供的报告改写，不编造额外行情数据。"
                         "报告必须保持10部分结构：今日结论、市场快照、宏观事件日历、驱动因素评分、技术面关键价位、分情景交易计划、风险控制、新闻风险、哪些情况不做、复盘模块。"
                         "不要新增大段栏目，不要改变栏目顺序。"
+                        "能用表格表达的模块必须保留Markdown表格，尤其是结论、市场快照、评分、关键价位、交易计划和复盘。"
                         "必须保留交易等级A/B/C、方向分、风险分、买入观察价、止损价和目标价。"
                         "驱动因素评分部分只展示最关键的5条，其余后台数据只说明已参与评分，不要全部展开。"
                         "避免使用震荡偏多、宽幅震荡、冲高回落、回踩、突破等交易黑话；必须用大白话解释。"
