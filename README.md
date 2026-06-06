@@ -23,6 +23,7 @@
 本项目交给 cron-job.org 定时触发，电脑、Codex、浏览器都不用在线。GitHub Actions 页面也可以手动运行，运行时选择：
 
 - `daily`：生成每日黄金24小时判断报告，推送微信，同时发送邮件到 `thunderwong46@gmail.com`，并保存当天报告和行情快照。
+- `evening`：只记录晚间市场快照，不推送微信，不发送邮件，用于周末复盘和次日早报参考。
 - `weekly`：生成每周复盘报告，推送微信，同时发送邮件到 `thunderwong46@gmail.com`，统计本周预测和真实金价之间的差距。
 
 ## cron-job.org 配置
@@ -49,7 +50,18 @@
 {"ref":"main","inputs":{"mode":"weekly"}}
 ```
 
-两个任务使用同一组 Headers：
+晚间快照任务：
+
+- 时间：每天北京时间 22:30 或 23:00
+- URL：同上
+- Method：`POST`
+- Body：
+
+```json
+{"ref":"main","inputs":{"mode":"evening"}}
+```
+
+三个任务使用同一组 Headers：
 
 - `Authorization`：`Bearer 你的 GitHub Token`
 - `Accept`：`application/vnd.github+json`
@@ -75,6 +87,7 @@
 
 - 定时由 cron-job.org 控制；GitHub Actions 只负责接到请求后生成报告、推送微信、保存归档。
 - 日报和每周复盘都会同时发送到邮箱 `thunderwong46@gmail.com`。如果没有配置 SMTP 密钥，邮件会跳过，微信推送仍会继续。
+- 晚间快照只写入 GitHub 数据归档，不发微信、不发邮件；次日早报会读取昨晚快照作为背景数据。
 - 报告会先读取最新金价，并在正文里显示“金价更新时间”。
 - 最新金价优先级：Twelve Data 的 XAU/USD 5分钟级行情；其次是 Yahoo Finance 的黄金期货/现货行情。
 - 如果金价不是 90 分钟内更新的数据，报告会自动降低信心，并提示先观望，不给进场建议。
@@ -90,7 +103,7 @@
 每次工作流运行后，会自动保存两类文件：
 
 - `reports/YYYY/YYYY-MM-DD.md`：当天推送给微信的完整报告，方便直接阅读。
-- `data/YYYY/YYYY-MM-DD.json`：当天报告对应的行情快照、后台参考数据、判断结论、关键价位、新闻线索，以及后续回填的24小时真实金价。
+- `data/YYYY/YYYY-MM-DD.json`：当天报告对应的行情快照、后台参考数据、晚间市场快照、判断结论、关键价位、新闻线索，以及后续回填的24小时真实金价。
 - `reviews/YYYY/YYYY-MM-DD.md`：每周六推送的复盘报告。
 - `reviews/YYYY/YYYY-MM-DD.json`：每周复盘的结构化数据，方便以后继续统计。
 

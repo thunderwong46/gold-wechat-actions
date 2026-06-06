@@ -77,6 +77,7 @@ class TradeDecision:
 class MarketContext:
     quotes: dict[str, Quote]
     notes: list[str]
+    prior_evening: dict[str, object] | None = None
 
 
 def now_cn() -> datetime:
@@ -445,6 +446,7 @@ def build_market_context(gold: Quote, dxy: Quote, tnx: Quote, gld: Quote | None)
         except Exception as exc:
             quotes[key] = Quote(key, key, None, None, None, None, "supplemental fetch", error=str(exc))
 
+    prior_evening = load_prior_evening_snapshot()
     notes = []
     usable_count = sum(1 for quote in quotes.values() if quote.value is not None)
     notes.append(f"后台参考数据共 {len(quotes)} 项，可用 {usable_count} 项。")
@@ -454,7 +456,39 @@ def build_market_context(gold: Quote, dxy: Quote, tnx: Quote, gld: Quote | None)
         notes.append("已纳入VIX，用来判断市场恐慌程度。")
     if quotes.get("silver") and quotes["silver"].value is not None:
         notes.append("已纳入白银，用来观察贵金属联动。")
-    return MarketContext(quotes=quotes, notes=notes)
+    if prior_evening:
+        notes.append("已读取昨晚市场快照，用来判断隔夜变化。")
+    return MarketContext(quotes=quotes, notes=notes, prior_evening=prior_evening)
+
+
+def load_prior_evening_snapshot() -> dict[str, object] | None:
+    current_date = now_cn().date()
+    for days_back in (1, 2, 3):
+        date_key = (current_date - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        year = date_key[:4]
+        data_path = Path("data") / year / f"{date_key}.json"
+        if not data_path.exists():
+            continue
+        try:
+            snapshot = json.loads(data_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        evening = snapshot.get("evening_snapshot")
+        if isinstance(evening, dict):
+            evening["source_date"] = date_key
+            return evening
+    return None
+
+
+def quote_value_from_snapshot(snapshot: dict[str, object], key: str) -> float | None:
+    quotes = snapshot.get("quotes")
+    if not isinstance(quotes, dict):
+        return None
+    item = quotes.get(key)
+    if not isinstance(item, dict):
+        return None
+    value = item.get("value")
+    return float(value) if isinstance(value, (int, float)) else None
 
 
 def pct(change: float | None, value: float | None) -> float | None:
@@ -575,6 +609,20 @@ def build_driver_scores(
         rows.append(DriverScore("美债收益率", f"近24小时 {fmt(tnx.change_24h)}", "方向不明", 0, 0, "利率端暂时没有明显方向。"))
 
     context_quotes = market_context.quotes if market_context else {}
+    prior_evening = market_context.prior_evening if market_context else None
+    if prior_evening:
+        evening_gold = quote_value_from_snapshot(prior_evening, "gold")
+        if evening_gold and gold.value is not None:
+            overnight_change = gold.value - evening_gold
+            overnight_pct = overnight_change / evening_gold * 100
+            risk = 1 if abs(overnight_pct) >= 0.8 else 0
+            if overnight_pct >= 0.3:
+                rows.append(DriverScore("隔夜金价", f"昨晚到今早 +{fmt(overnight_pct)}%", "支持上涨", 1, risk, "昨晚之后金价继续走强，说明买盘没有立刻消失。"))
+            elif overnight_pct <= -0.3:
+                rows.append(DriverScore("隔夜金价", f"昨晚到今早 {fmt(overnight_pct)}%", "支持下跌", -1, risk, "昨晚之后金价继续走弱，说明卖压还在。"))
+            else:
+                rows.append(DriverScore("隔夜金价", f"昨晚到今早 {fmt(overnight_pct)}%", "方向不明", 0, 0, "昨晚到今早变化不大，隔夜走势没有给出强信号。"))
+
     real_10y = context_quotes.get("real_10y")
     if real_10y and real_10y.value is not None:
         if real_10y.change_24h is not None and real_10y.change_24h <= -0.04:
@@ -1344,6 +1392,7 @@ def archive_report(
         },
         "market_context": {
             "notes": market_context.notes if market_context else [],
+            "prior_evening": market_context.prior_evening if market_context else None,
             "quotes": {
                 key: quote_to_dict(value)
                 for key, value in (market_context.quotes if market_context else {}).items()
@@ -1359,6 +1408,110 @@ def archive_report(
     report_path.write_text(report + "\n", encoding="utf-8")
     data_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"Archived report to {report_path} and {data_path}.")
+
+
+def collect_market_inputs() -> tuple[Quote, Quote, Quote, Quote, list[str], list[CalendarEvent], MarketContext]:
+    gold = fetch_best_gold_quote()
+    dxy = fetch_best_dxy_quote()
+    tnx = fetch_best_tnx_quote()
+    gld = fetch_best_gld_quote()
+    market_context = build_market_context(gold, dxy, tnx, gld)
+    news = fetch_news()
+    calendar_events = fetch_economic_calendar()
+    return gold, dxy, tnx, gld, news, calendar_events, market_context
+
+
+def build_evening_snapshot(
+    gold: Quote,
+    dxy: Quote,
+    tnx: Quote,
+    gld: Quote | None,
+    news: list[str],
+    calendar_events: list[CalendarEvent],
+    market_context: MarketContext | None,
+) -> dict[str, object]:
+    decision = judge(gold, dxy, tnx, news, calendar_events, market_context)
+    return {
+        "captured_at": now_cn().isoformat(),
+        "quotes": {
+            "gold": quote_to_dict(gold),
+            "dxy": quote_to_dict(dxy),
+            "us10y": quote_to_dict(tnx),
+            "gld": quote_to_dict(gld) if gld is not None else None,
+        },
+        "market_context": {
+            "notes": market_context.notes if market_context else [],
+            "quotes": {
+                key: quote_to_dict(value)
+                for key, value in (market_context.quotes if market_context else {}).items()
+            },
+        },
+        "news": news,
+        "calendar_events": [calendar_to_dict(event) for event in calendar_events],
+        "news_risk_flags": news_risk_flags(news),
+        "evening_assessment": {
+            "headline": decision.headline,
+            "trade_grade": decision.trade_grade,
+            "direction_score": decision.direction_score,
+            "risk_score": decision.risk_score,
+            "confidence": decision.confidence,
+            "driver_scores": [
+                {
+                    "factor": item.factor,
+                    "observation": item.observation,
+                    "effect": item.effect,
+                    "direction_score": item.direction_score,
+                    "risk_score": item.risk_score,
+                    "explanation": item.explanation,
+                }
+                for item in decision.driver_scores
+            ],
+        },
+    }
+
+
+def archive_evening_snapshot(
+    gold: Quote,
+    dxy: Quote,
+    tnx: Quote,
+    gld: Quote | None,
+    news: list[str],
+    calendar_events: list[CalendarEvent],
+    market_context: MarketContext | None,
+) -> None:
+    captured_at = now_cn()
+    date_key = captured_at.strftime("%Y-%m-%d")
+    year = captured_at.strftime("%Y")
+    data_path = Path("data") / year / f"{date_key}.json"
+    data_path.parent.mkdir(parents=True, exist_ok=True)
+    if data_path.exists():
+        try:
+            snapshot = json.loads(data_path.read_text(encoding="utf-8"))
+        except Exception:
+            snapshot = {"date": date_key}
+    else:
+        snapshot = {
+            "date": date_key,
+            "generated_at": None,
+            "note": "仅晚间市场快照；当天早报数据尚未归档。",
+        }
+
+    evening = build_evening_snapshot(gold, dxy, tnx, gld, news, calendar_events, market_context)
+    morning_gold = ((snapshot.get("quotes") or {}).get("gold") or {}).get("value")
+    evening_gold = gold.value
+    if isinstance(morning_gold, (int, float)) and isinstance(evening_gold, (int, float)):
+        change = float(evening_gold) - float(morning_gold)
+        evening["change_from_morning"] = {
+            "morning_gold_value": float(morning_gold),
+            "evening_gold_value": float(evening_gold),
+            "change": change,
+            "pct_change": change / float(morning_gold) * 100 if morning_gold else None,
+            "note": "晚间金价相对早报报告价的变化。",
+        }
+
+    snapshot["evening_snapshot"] = evening
+    data_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"Archived evening market snapshot to {data_path}.")
 
 
 def load_daily_snapshots() -> list[tuple[Path, dict[str, object]]]:
@@ -1516,6 +1669,18 @@ def build_weekly_review() -> tuple[str, dict[str, object]]:
             pct_value = None
         actual = actual_direction(pct_value)
         result = accuracy_result(predicted, actual)
+        evening_snapshot = snapshot.get("evening_snapshot") or {}
+        evening_change = None
+        evening_assessment = {}
+        if isinstance(evening_snapshot, dict):
+            change_from_morning = evening_snapshot.get("change_from_morning") or {}
+            if isinstance(change_from_morning, dict):
+                evening_pct = change_from_morning.get("pct_change")
+                if isinstance(evening_pct, (int, float)):
+                    evening_change = float(evening_pct)
+            evening_assessment_raw = evening_snapshot.get("evening_assessment") or {}
+            if isinstance(evening_assessment_raw, dict):
+                evening_assessment = evening_assessment_raw
         calendar_events = snapshot.get("calendar_events") or []
         high_event_count = sum(
             1
@@ -1528,6 +1693,8 @@ def build_weekly_review() -> tuple[str, dict[str, object]]:
             risk_note.append(f"{high_event_count}个高影响财经事件")
         if isinstance(risk_flags, list) and risk_flags:
             risk_note.append("新闻风险：" + "、".join(str(item) for item in risk_flags[:2]))
+        if evening_change is not None:
+            risk_note.append(f"晚间相对早报 {fmt(evening_change)}%")
         risk_text = "；".join(risk_note) if risk_note else "未记录明显事件风险"
 
         if result != "未统计":
@@ -1548,6 +1715,10 @@ def build_weekly_review() -> tuple[str, dict[str, object]]:
                 "start_value": start_value,
                 "actual_value": actual_value,
                 "pct_change": pct_value,
+                "evening_pct_change": evening_change,
+                "evening_headline": evening_assessment.get("headline"),
+                "evening_direction_score": evening_assessment.get("direction_score"),
+                "evening_risk_score": evening_assessment.get("risk_score"),
                 "actual": actual,
                 "result": result,
                 "risk_text": risk_text,
@@ -1559,7 +1730,7 @@ def build_weekly_review() -> tuple[str, dict[str, object]]:
     row_text = "\n".join(
         (
             f"- {row['date']}：预测 {row['predicted']}；报告价 {fmt(row['start_value'])}；"
-            f"24小时后 {fmt(row['actual_value'])}；真实变化 {fmt(row['pct_change'])}%；"
+            f"晚间变化 {fmt(row['evening_pct_change'])}%；24小时后 {fmt(row['actual_value'])}；真实变化 {fmt(row['pct_change'])}%；"
             f"结果 {row['result']}；交易等级 {row['trade_grade']}；方向分 {row['direction_score']}；风险分 {row['risk_score']}；当日风险：{row['risk_text']}"
         )
         for row in rows
@@ -1695,20 +1866,19 @@ def fetch_best_gld_quote() -> Quote:
 
 def run_daily() -> None:
     update_pending_outcomes()
-    gold = fetch_best_gold_quote()
-
-    dxy = fetch_best_dxy_quote()
-    tnx = fetch_best_tnx_quote()
-    gld = fetch_best_gld_quote()
-    market_context = build_market_context(gold, dxy, tnx, gld)
-    news = fetch_news()
-    calendar_events = fetch_economic_calendar()
+    gold, dxy, tnx, gld, news, calendar_events, market_context = collect_market_inputs()
 
     raw = rules_report(gold, dxy, tnx, gld, news, calendar_events, market_context)
     report = sanitize_report(improve_with_openai(raw))
     archive_report(report, raw, gold, dxy, tnx, gld, news, calendar_events, market_context)
     send_serverchan("每日黄金24小时交易判断", report)
     print("Report sent through ServerChan.")
+
+
+def run_evening() -> None:
+    gold, dxy, tnx, gld, news, calendar_events, market_context = collect_market_inputs()
+    archive_evening_snapshot(gold, dxy, tnx, gld, news, calendar_events, market_context)
+    print("Evening market snapshot archived.")
 
 
 def run_test_daily() -> None:
@@ -1850,6 +2020,8 @@ def main() -> None:
     mode = (os.getenv("REPORT_MODE") or "daily").strip().lower()
     if mode == "weekly":
         run_weekly()
+    elif mode == "evening":
+        run_evening()
     elif mode in {"test_daily", "test"}:
         run_test_daily()
     else:

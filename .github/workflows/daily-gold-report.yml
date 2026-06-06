@@ -67,6 +67,9 @@ jobs:
           date_key = now.strftime("%Y-%m-%d")
           year = now.strftime("%Y")
           mode = (os.getenv("REPORT_MODE") or "daily").strip().lower()
+          if mode == "evening":
+              print("Email skipped: evening snapshot archives data only.")
+              raise SystemExit(0)
           if mode == "weekly":
               subject = "每周黄金报告复盘"
               report_path = Path("reviews") / year / f"{date_key}.md"
