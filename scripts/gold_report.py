@@ -6,6 +6,8 @@ import os
 import re
 import urllib.parse
 import xml.etree.ElementTree as ET
+import csv
+import io
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from html import unescape
@@ -72,6 +74,15 @@ class TradeDecision:
 
 
 def now_cn() -> datetime:
+    report_at = (os.getenv("REPORT_AT") or "").strip()
+    if report_at:
+        try:
+            parsed = datetime.fromisoformat(report_at)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=CN_TZ)
+            return parsed.astimezone(CN_TZ)
+        except ValueError:
+            pass
     return datetime.now(CN_TZ)
 
 
@@ -164,6 +175,63 @@ def fetch_twelvedata_chart(symbol: str, name: str, *, interval: str = "5min") ->
         )
     except Exception as exc:
         return Quote(name=name, symbol=symbol, value=None, change_24h=None, high_24h=None, low_24h=None, source=url, error=str(exc))
+
+
+def fetch_treasury_10y() -> Quote:
+    year = now_cn().strftime("%Y")
+    url = (
+        "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/"
+        f"daily-treasury-rates.csv/{year}/all?type=daily_treasury_yield_curve"
+        f"&field_tdr_date_value={year}&page&_format=csv"
+    )
+    try:
+        resp = http_get(url, timeout=25)
+        resp.raise_for_status()
+        rows = list(csv.DictReader(io.StringIO(resp.text)))
+        points = []
+        for row in rows:
+            date_text = row.get("Date") or ""
+            value_text = row.get("10 Yr") or ""
+            try:
+                dt = datetime.strptime(date_text, "%m/%d/%Y").replace(tzinfo=CN_TZ)
+                value = float(value_text)
+            except ValueError:
+                continue
+            if dt.date() <= now_cn().date():
+                points.append((dt, value))
+        points.sort(key=lambda item: item[0])
+        if not points:
+            raise ValueError("no valid 10Y yield rows")
+
+        latest_dt, latest = points[-1]
+        prior = points[-2][1] if len(points) >= 2 else latest
+        recent = [value for _, value in points[-5:]]
+        return Quote(
+            name="US 10Y Treasury Yield",
+            symbol="10Y Treasury",
+            value=latest,
+            change_24h=latest - prior,
+            high_24h=max(recent) if recent else None,
+            low_24h=min(recent) if recent else None,
+            source="U.S. Treasury daily treasury rates CSV",
+            updated_at=latest_dt,
+        )
+    except Exception as exc:
+        return Quote(name="US 10Y Treasury Yield", symbol="10Y Treasury", value=None, change_24h=None, high_24h=None, low_24h=None, source=url, error=str(exc))
+
+
+def first_usable_quote(quotes: list[Quote], *, require_recent: bool = False) -> Quote:
+    fallback = quotes[0] if quotes else Quote("Unknown", "Unknown", None, None, None, None, "none")
+    for quote in quotes:
+        if quote.value is None:
+            continue
+        if require_recent:
+            age = quote_age_minutes(quote)
+            if age is None or age > 90:
+                fallback = quote
+                continue
+        return quote
+    return fallback
 
 
 def fetch_news() -> list[str]:
@@ -1284,6 +1352,21 @@ def fetch_best_quote(symbol: str, name: str) -> Quote:
     return quote
 
 
+def fetch_best_market_quote(
+    yahoo_symbol: str,
+    name: str,
+    *,
+    twelvedata_symbols: list[str] | None = None,
+) -> Quote:
+    candidates: list[Quote] = []
+    for td_symbol in twelvedata_symbols or []:
+        candidates.append(fetch_twelvedata_chart(td_symbol, name))
+    candidates.append(fetch_yahoo_chart(yahoo_symbol, name, range_="1d", interval="5m"))
+    candidates.append(fetch_yahoo_chart(yahoo_symbol, name, range_="5d", interval="1h"))
+    candidates.append(fetch_yahoo_chart(yahoo_symbol, name, range_="1mo", interval="1d"))
+    return first_usable_quote(candidates)
+
+
 def fetch_best_gold_quote() -> Quote:
     quote = fetch_twelvedata_chart("XAU/USD", "Spot Gold")
     age = quote_age_minutes(quote)
@@ -1301,13 +1384,28 @@ def fetch_best_gold_quote() -> Quote:
     return quote
 
 
+def fetch_best_dxy_quote() -> Quote:
+    return fetch_best_market_quote("DX-Y.NYB", "US Dollar Index", twelvedata_symbols=["DXY", "USDOLLAR"])
+
+
+def fetch_best_tnx_quote() -> Quote:
+    quote = fetch_best_market_quote("^TNX", "US 10Y Treasury Yield", twelvedata_symbols=["US10Y", "TNX"])
+    if quote.value is not None:
+        return quote
+    return fetch_treasury_10y()
+
+
+def fetch_best_gld_quote() -> Quote:
+    return fetch_best_market_quote("GLD", "SPDR Gold ETF", twelvedata_symbols=["GLD"])
+
+
 def run_daily() -> None:
     update_pending_outcomes()
     gold = fetch_best_gold_quote()
 
-    dxy = fetch_best_quote("DX-Y.NYB", "US Dollar Index")
-    tnx = fetch_best_quote("^TNX", "US 10Y Treasury Yield")
-    gld = fetch_best_quote("GLD", "SPDR Gold ETF")
+    dxy = fetch_best_dxy_quote()
+    tnx = fetch_best_tnx_quote()
+    gld = fetch_best_gld_quote()
     news = fetch_news()
     calendar_events = fetch_economic_calendar()
 
@@ -1316,6 +1414,75 @@ def run_daily() -> None:
     archive_report(report, raw, gold, dxy, tnx, gld, news, calendar_events)
     send_serverchan("每日黄金24小时交易判断", report)
     print("Report sent through ServerChan.")
+
+
+def run_test_daily() -> None:
+    report_at = now_cn()
+    updated_at = report_at - timedelta(minutes=8)
+    gold = Quote(
+        name="Spot Gold",
+        symbol="XAU/USD",
+        value=3354.20,
+        change_24h=-43.80,
+        high_24h=3407.10,
+        low_24h=3340.60,
+        source="历史测试快照：昨天9点附近黄金行情，用于预览报告结构",
+        updated_at=updated_at,
+    )
+    dxy = Quote(
+        name="US Dollar Index",
+        symbol="DXY",
+        value=104.18,
+        change_24h=0.32,
+        high_24h=104.35,
+        low_24h=103.72,
+        source="历史测试快照：昨天9点附近美元指数",
+        updated_at=updated_at,
+    )
+    tnx = Quote(
+        name="US 10Y Treasury Yield",
+        symbol="10Y Treasury",
+        value=4.55,
+        change_24h=0.08,
+        high_24h=4.55,
+        low_24h=4.47,
+        source="U.S. Treasury daily treasury rates CSV, 2026-06-05",
+        updated_at=updated_at,
+    )
+    gld = Quote(
+        name="SPDR Gold ETF",
+        symbol="GLD",
+        value=308.70,
+        change_24h=-3.60,
+        high_24h=312.20,
+        low_24h=307.90,
+        source="历史测试快照：昨天9点附近GLD黄金ETF",
+        updated_at=updated_at,
+    )
+    news = [
+        "Gold slides as stronger U.S. jobs data lifts dollar and Treasury yields",
+        "Treasury yields rise after labor market data reduces near-term rate-cut hopes",
+        "Dollar index strengthens as traders reassess Fed policy path",
+        "Gold traders watch U.S. inflation and Fed comments for next direction",
+    ]
+    calendar_events = [
+        CalendarEvent(
+            event="U.S. Employment Situation / Nonfarm Payrolls",
+            country="US",
+            time_text="20:30",
+            period="May",
+            actual="-",
+            expected="-",
+            prior="-",
+            importance="高",
+        )
+    ]
+    raw = rules_report(gold, dxy, tnx, gld, news, calendar_events)
+    raw = raw.replace("# 黄金日报：24小时交易决策仪表盘", "# 黄金日报：24小时交易决策仪表盘（历史测试版）", 1)
+    raw += "\n\n测试说明：这份报告使用昨天9点附近的历史测试快照，只用于查看正式报告长什么样；正式日报会抓取实时数据。"
+    report = sanitize_report(improve_with_openai(raw))
+    send_serverchan("测试：每日黄金24小时交易判断", report)
+    print("Test report sent through ServerChan.")
 
 
 def run_weekly() -> None:
@@ -1330,6 +1497,8 @@ def main() -> None:
     mode = (os.getenv("REPORT_MODE") or "daily").strip().lower()
     if mode == "weekly":
         run_weekly()
+    elif mode in {"test_daily", "test"}:
+        run_test_daily()
     else:
         run_daily()
 
