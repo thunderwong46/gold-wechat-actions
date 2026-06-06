@@ -705,6 +705,53 @@ def build_core_logic(decision: TradeDecision) -> str:
     return "；".join(parts)
 
 
+def build_daily_view(decision: TradeDecision) -> str:
+    if decision.risk_score >= 3 and decision.trade_grade == "C":
+        return "事件风险主导，先观察"
+    if "上涨机会" in decision.headline:
+        return "上涨机会更大"
+    if "下跌风险" in decision.headline:
+        return "下跌风险更大"
+    return "方向不清楚"
+
+
+def build_conclusion_table(decision: TradeDecision, core_logic: str) -> str:
+    max_risk = "今天有重要数据或新闻风险，价格可能突然大幅波动。" if decision.risk_score >= 2 else "暂未发现特别强的事件风险，但不能满仓。"
+    return "\n".join(
+        [
+            "| 项目 | 今天的答案 | 小白解释 |",
+            "| --- | --- | --- |",
+            f"| 今日黄金观点 | {build_daily_view(decision)} | 这不是保证涨跌，只是未来24小时更值得防哪边。 |",
+            f"| 今日交易等级 | {decision.trade_grade}，{decision.trade_grade_text} | A可以按计划做；B只能小仓位；C最好不做。 |",
+            f"| 核心逻辑 | {core_logic} | 只看真正会影响金价的几个变量。 |",
+            f"| 最大风险 | {max_risk} | 风险高时，宁愿错过，也不要追进去。 |",
+            f"| 操作原则 | {decision.action} | 没到计划价格，不交易；看不懂原因，也不交易。 |",
+        ]
+    )
+
+
+def build_score_summary(decision: TradeDecision) -> str:
+    if decision.direction_score >= 4:
+        direction_text = "上涨理由比较集中"
+    elif decision.direction_score >= 2:
+        direction_text = "上涨理由略多"
+    elif decision.direction_score <= -4:
+        direction_text = "下跌理由比较集中"
+    elif decision.direction_score <= -2:
+        direction_text = "下跌理由略多"
+    else:
+        direction_text = "方向理由不够集中"
+
+    if decision.risk_score >= 4:
+        risk_text = "风险偏高，新手不适合主动交易"
+    elif decision.risk_score >= 2:
+        risk_text = "有明显风险，只能轻仓或观察"
+    else:
+        risk_text = "风险暂时可控，但仍要止损"
+
+    return f"- 总方向分：{decision.direction_score}，{direction_text}。\n- 总风险分：{decision.risk_score}，{risk_text}。"
+
+
 def build_market_snapshot(gold: Quote, dxy: Quote, tnx: Quote, gld: Quote | None = None) -> str:
     gold_pct = pct(gold.change_24h, gold.value)
     dxy_pct = pct(dxy.change_24h, dxy.value)
@@ -850,19 +897,19 @@ def rules_report(
     risk_flags = news_risk_flags(news)
     news_risk_text = "、".join(risk_flags) if risk_flags else "暂未发现特别强的新闻风险词"
     core_logic = build_core_logic(decision)
+    conclusion_table = build_conclusion_table(decision, core_logic)
+    score_summary = build_score_summary(decision)
 
-    return f"""# 黄金日报：24小时交易决策仪表盘
+    return f"""# 黄金日报：交易决策版
 
 时间：{today}
 标的：国际黄金，现货黄金/XAUUSD为主。
 
 ## 1. 今日结论，先给答案
-- 今日黄金观点：{decision.headline}
-- 交易等级：{decision.trade_grade}，{decision.trade_grade_text}
-- 判断信心：{decision.confidence}
-- 核心逻辑：{core_logic}
-- 最大风险：{"今天有重要数据或新闻风险，容易突然大幅波动。" if decision.risk_score >= 2 else "暂未发现特别强的事件风险，但仍不能满仓。"}
-- 操作原则：{decision.action}
+{conclusion_table}
+
+一句话执行：{decision.action}
+判断信心：{decision.confidence}
 
 ## 2. 市场快照
 {market_snapshot}
@@ -871,8 +918,7 @@ def rules_report(
 {calendar_text}
 
 ## 4. 驱动因素评分
-- 方向分：{decision.direction_score}。正数越高，越支持上涨；负数越低，越支持下跌。
-- 风险分：{decision.risk_score}。分数越高，越不适合新手交易。
+{score_summary}
 {driver_text}
 
 ## 5. 技术面，只保留关键价位
@@ -881,41 +927,42 @@ def rules_report(
 - 第一目标/减仓价：{levels["resistance_near"]}
 - 第二目标/减仓价：{levels["resistance_key"]}
 
-## 6. 今日交易计划，分情景执行
+## 6. 今日交易计划，必须分情景
 - 入场规则：{entry_rule}
 - 目标/减仓：{target_rule}
 - 止损/认错：{stop_rule}
 {scenarios_text}
 
-## 7. 哪些情况直接不做
-{no_trade_text}
-
-## 8. 今天最容易亏钱的情况
-{loss_traps_text}
-
-## 9. 近24小时新闻线索
-- 新闻风险归纳：{news_risk_text}
-{news_text}
-
-## 10. 为什么这么判断
-{reasons_text}
-
-## 11. 24小时概率判断
-{probs_text}
-
-## 12. 风险控制模块
+## 7. 风险控制模块
 - 新手仓位：单笔最多只让账户亏损 0.5% 到 1%。
 - 不加仓摊平亏损单；方向错了先退出。
 - 数据前后30分钟波动会放大，除非经验足够，否则不做追单。
 - 这份报告追求的是提高胜率和减少乱交易，不能保证每天盈利。
 
-## 13. 今日复盘记录
+## 8. 新闻与地缘风险
+- 新闻风险归纳：{news_risk_text}
+{news_text}
+
+## 9. 哪些情况直接不做
+{no_trade_text}
+
+今天最容易亏钱的动作：
+{loss_traps_text}
+
+## 10. 复盘模块
 - 今天预测方向：{decision.headline}
 - 交易等级：{decision.trade_grade}
+- 方向分：{decision.direction_score}
+- 风险分：{decision.risk_score}
+- 24小时概率判断：
+{probs_text}
 - 报告价：{fmt(gold.value)}
 - 24小时后会记录真实金价，并在周六复盘里比较预测和实际变化。
 
-## 14. 来源与备注
+## 判断依据补充
+{reasons_text}
+
+## 来源与备注
 - 行情源：{gold.source}；{dxy.source}；{tnx.source}{f"；{gld.source}" if gld is not None else ""}
 - 新闻源：Google News RSS
 - 财经日历源：Yahoo Finance Economic Calendar
@@ -943,7 +990,8 @@ def improve_with_openai(raw_report: str) -> str:
                     "content": (
                         "你是谨慎的黄金投资分析助手，服务对象是黄金投资新手。"
                         "只基于用户提供的报告改写，不编造额外行情数据。"
-                        "报告要保持交易决策仪表盘结构：今日结论、市场快照、宏观日历、驱动因素评分、关键价位、分情景交易计划、风险控制、复盘记录。"
+                        "报告必须保持10部分结构：今日结论、市场快照、宏观事件日历、驱动因素评分、技术面关键价位、分情景交易计划、风险控制、新闻风险、哪些情况不做、复盘模块。"
+                        "不要新增大段栏目，不要改变栏目顺序。"
                         "必须保留交易等级A/B/C、方向分、风险分、买入观察价、止损价和目标价。"
                         "避免使用震荡偏多、宽幅震荡、冲高回落、回踩、突破等交易黑话；必须用大白话解释。"
                         "把每个专业词都翻译成普通投资者能理解的话。句子要短，直接告诉用户今天该不该动手、为什么、错了怎么办。"
@@ -952,7 +1000,7 @@ def improve_with_openai(raw_report: str) -> str:
                 },
                 {
                     "role": "user",
-                    "content": "请把下面的规则版报告优化成小白也能看懂、能照着执行的黄金日报，不使用交易黑话，完整保留交易等级、评分、关键价格、分情景计划、概率、风险控制和免责声明：\n\n"
+                    "content": "请把下面的规则版报告优化成小白也能看懂、能照着执行的黄金日报。必须保留原来的10部分结构和顺序，不使用交易黑话，完整保留交易等级、评分、关键价格、分情景计划、概率、风险控制和免责声明：\n\n"
                     + raw_report,
                 },
             ],
@@ -1478,7 +1526,7 @@ def run_test_daily() -> None:
         )
     ]
     raw = rules_report(gold, dxy, tnx, gld, news, calendar_events)
-    raw = raw.replace("# 黄金日报：24小时交易决策仪表盘", "# 黄金日报：24小时交易决策仪表盘（历史测试版）", 1)
+    raw = raw.replace("# 黄金日报：交易决策版", "# 黄金日报：交易决策版（历史测试）", 1)
     raw += "\n\n测试说明：这份报告使用昨天9点附近的历史测试快照，只用于查看正式报告长什么样；正式日报会抓取实时数据。"
     report = sanitize_report(improve_with_openai(raw))
     send_serverchan("测试：每日黄金24小时交易判断", report)
