@@ -31,7 +31,6 @@ jobs:
         env:
           SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
           TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           REPORT_MODE: ${{ github.event.inputs.mode || 'daily' }}
         run: python scripts/gold_report.py
 
