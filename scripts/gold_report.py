@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import urllib.parse
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from html import unescape
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -31,6 +33,18 @@ class Quote:
     source: str
     updated_at: datetime | None = None
     error: str | None = None
+
+
+@dataclass
+class CalendarEvent:
+    event: str
+    country: str
+    time_text: str
+    period: str
+    actual: str
+    expected: str
+    prior: str
+    importance: str
 
 
 def now_cn() -> datetime:
@@ -145,6 +159,127 @@ def fetch_news() -> list[str]:
         return []
 
 
+IMPORTANT_EVENT_KEYWORDS = [
+    "nonfarm",
+    "payroll",
+    "unemployment",
+    "cpi",
+    "consumer price",
+    "pce",
+    "ppi",
+    "fomc",
+    "fed",
+    "powell",
+    "jobless claims",
+    "gdp",
+    "retail sales",
+    "ism",
+    "pmi",
+    "jolts",
+    "adp",
+    "durable goods",
+    "consumer confidence",
+    "treasury",
+]
+
+
+def clean_html_text(value: str) -> str:
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = unescape(value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def event_importance(event: str, country: str) -> str:
+    text = event.lower()
+    if country.upper() == "US" and any(keyword in text for keyword in IMPORTANT_EVENT_KEYWORDS):
+        return "高"
+    if country.upper() in {"US", "EU", "GB", "JP", "CN"}:
+        return "中"
+    return "低"
+
+
+def fetch_economic_calendar() -> list[CalendarEvent]:
+    today = now_cn().strftime("%Y-%m-%d")
+    url = f"https://finance.yahoo.com/calendar/economic?day={today}"
+    try:
+        resp = http_get(url, timeout=20)
+        resp.raise_for_status()
+        html = resp.text
+        table_idx = html.find('data-testid="data-table-v2"')
+        if table_idx >= 0:
+            html = html[table_idx:]
+
+        events: list[CalendarEvent] = []
+        for row_html in re.findall(r"<tr[^>]*>(.*?)</tr>", html, flags=re.S | re.I):
+            cells = re.findall(r"<td[^>]*>(.*?)</td>", row_html, flags=re.S | re.I)
+            if len(cells) < 7:
+                continue
+            values = [clean_html_text(cell) for cell in cells[:7]]
+            if not values[0] or values[0].lower() == "event":
+                continue
+            country = values[1].upper()
+            event = values[0]
+            importance = event_importance(event, country)
+            events.append(
+                CalendarEvent(
+                    event=event,
+                    country=country,
+                    time_text=values[2],
+                    period=values[3],
+                    actual=values[4],
+                    expected=values[5],
+                    prior=values[6],
+                    importance=importance,
+                )
+            )
+
+        important = [event for event in events if event.importance == "高"]
+        medium_us = [event for event in events if event.importance == "中" and event.country == "US"]
+        return (important + medium_us)[:10]
+    except Exception:
+        return [
+            CalendarEvent(
+                event="财经日历抓取失败",
+                country="-",
+                time_text="-",
+                period="-",
+                actual="-",
+                expected="-",
+                prior="-",
+                importance="未知",
+            )
+        ]
+
+
+def calendar_to_dict(event: CalendarEvent) -> dict[str, str]:
+    return {
+        "event": event.event,
+        "country": event.country,
+        "time_text": event.time_text,
+        "period": event.period,
+        "actual": event.actual,
+        "expected": event.expected,
+        "prior": event.prior,
+        "importance": event.importance,
+    }
+
+
+def news_risk_flags(news: list[str]) -> list[str]:
+    text = " ".join(news).lower()
+    flags = []
+    checks = [
+        ("美联储/鲍威尔相关消息", ["fed", "fomc", "powell", "rate cut", "rate hike"]),
+        ("通胀数据相关消息", ["inflation", "cpi", "pce", "ppi"]),
+        ("就业数据相关消息", ["payroll", "jobs", "unemployment", "jobless"]),
+        ("地缘政治或避险消息", ["war", "attack", "ceasefire", "tariff", "sanction", "geopolitical"]),
+        ("美元或美债剧烈波动线索", ["dollar", "treasury yields", "yields"]),
+    ]
+    for label, keywords in checks:
+        if any(keyword in text for keyword in keywords):
+            flags.append(label)
+    return flags
+
+
 def pct(change: float | None, value: float | None) -> float | None:
     if change is None or value is None:
         return None
@@ -200,10 +335,18 @@ def build_levels(gold: Quote) -> dict[str, str]:
     }
 
 
-def judge(gold: Quote, dxy: Quote, tnx: Quote) -> tuple[str, str, dict[str, int], list[str], str]:
+def judge(
+    gold: Quote,
+    dxy: Quote,
+    tnx: Quote,
+    news: list[str] | None = None,
+    calendar_events: list[CalendarEvent] | None = None,
+) -> tuple[str, str, dict[str, int], list[str], str]:
     score = 0
     reasons = []
     gold_age = quote_age_minutes(gold)
+    news = news or []
+    calendar_events = calendar_events or []
 
     gold_pct = pct(gold.change_24h, gold.value)
     dxy_pct = pct(dxy.change_24h, dxy.value)
@@ -239,6 +382,15 @@ def judge(gold: Quote, dxy: Quote, tnx: Quote) -> tuple[str, str, dict[str, int]
     if gold_age is None or gold_age > 90:
         reasons.append("金价不是90分钟内更新的数据，这种情况下不要按点位交易，只观察")
 
+    high_events = [event for event in calendar_events if event.importance == "高"]
+    if high_events:
+        names = "、".join(event.event for event in high_events[:3])
+        reasons.append(f"今天有高影响财经事件：{names}。事件前后容易突然拉升或跳水，新手不要追单")
+
+    risk_flags = news_risk_flags(news)
+    if risk_flags:
+        reasons.append("新闻面出现风险线索：" + "、".join(risk_flags[:3]) + "。需要降低仓位或等待价格稳定")
+
     if gold_age is None or gold_age > 90:
         return (
             "行情不够新，先不要交易",
@@ -248,20 +400,29 @@ def judge(gold: Quote, dxy: Quote, tnx: Quote) -> tuple[str, str, dict[str, int]
             "低",
         )
 
-    if score >= 2:
-        headline = "更可能小涨，但中间会来回晃"
-        action = "只在跌到买入区并止住时小仓位买；不要追高"
-        probs = {"更可能小涨": 50, "方向不清楚，来回晃": 30, "可能先涨后跌": 20}
-    elif score <= -2:
-        headline = "更可能小跌，先别急着买"
-        action = "观望为主；除非价格重新站稳关键位置，否则不追多"
-        probs = {"更可能小跌": 50, "方向不清楚，来回晃": 30, "跌多了再反弹": 20}
-    else:
-        headline = "方向不清楚，大概率来回晃"
-        action = "先观望；只在关键买入区或卖出区出现明确信号时再动手"
-        probs = {"方向不清楚，来回晃": 45, "更可能小涨": 30, "更可能小跌": 25}
+    if high_events and abs(score) < 2:
+        return (
+            "今天先以观望为主",
+            "有重要数据或事件，但黄金、美元、美债没有给出同一方向；新手先别开新仓",
+            {"先观望": 60, "小幅上涨": 20, "小幅下跌": 20},
+            reasons,
+            "中低",
+        )
 
-    if missing >= 2:
+    if score >= 2:
+        headline = "上涨机会略大"
+        action = "只等价格跌到计划买入区并稳住后小仓位买；价格已经涨远就不追"
+        probs = {"上涨机会略大": 50, "方向不清楚": 30, "先涨后跌": 20}
+    elif score <= -2:
+        headline = "下跌风险略大"
+        action = "不建议新买；已有多单先保护利润，除非价格重新回到强势区"
+        probs = {"下跌风险略大": 50, "方向不清楚": 30, "跌多后反弹": 20}
+    else:
+        headline = "方向不清楚"
+        action = "先观望；只有价格到计划区并明显稳住，才考虑小仓位"
+        probs = {"方向不清楚": 45, "上涨机会": 30, "下跌风险": 25}
+
+    if missing >= 2 or high_events:
         confidence = "低"
     elif abs(score) >= 2 and missing == 0:
         confidence = "中高"
@@ -310,77 +471,144 @@ def build_market_checklist(gold: Quote, dxy: Quote, tnx: Quote) -> list[str]:
     return rows
 
 
-def rules_report(gold: Quote, dxy: Quote, tnx: Quote, news: list[str]) -> str:
+def build_calendar_text(events: list[CalendarEvent]) -> str:
+    if not events:
+        return "- 今天暂未抓到重要财经日历。"
+    rows = []
+    for event in events[:8]:
+        if event.event == "财经日历抓取失败":
+            rows.append("- 财经日历抓取失败：今天的事件风险需要手动留意。")
+            continue
+        impact = "新手先观望" if event.importance == "高" else "留意即可"
+        rows.append(
+            f"- {event.time_text}｜{event.country}｜{event.event}｜重要性：{event.importance}｜处理：{impact}"
+        )
+    return "\n".join(rows)
+
+
+def build_trade_rules(headline: str, levels: dict[str, str], gold: Quote) -> tuple[str, str, str]:
+    if gold.value is None:
+        return (
+            "不能交易：没有可用金价。",
+            "等下一次报告或手动确认最新金价。",
+            "没有最新价格时，不设置止损和目标。",
+        )
+
+    if "上涨机会" in headline:
+        return (
+            f"可以只等低位买：价格回到 {levels['support_near']} 附近，并且不再继续跌，才考虑小仓位。",
+            f"第一目标看 {levels['resistance_near']}；到了先减仓，不贪。",
+            f"如果跌破 {levels['support_key']}，说明判断错了，先离场。",
+        )
+    if "下跌风险" in headline:
+        return (
+            "今天不建议新买黄金。",
+            f"已有多单可以把 {levels['support_near']} 当作保护线，跌破就先减仓或离场。",
+            f"只有重新站回 {levels['resistance_near']} 上方，才说明下跌风险缓和。",
+        )
+    return (
+        "今天默认观望，不主动找交易。",
+        f"除非价格跌到 {levels['support_near']} 并明显稳住，或涨过 {levels['resistance_near']} 后没有马上跌回。",
+        f"如果进场，跌破 {levels['support_key']} 就退出；没到计划位置就不做。",
+    )
+
+
+def build_no_trade_conditions(gold: Quote, events: list[CalendarEvent]) -> list[str]:
+    rows = []
+    gold_age = quote_age_minutes(gold)
+    if gold_age is None or gold_age > 90:
+        rows.append("金价不是90分钟内更新的数据。")
+    if any(event.importance == "高" for event in events):
+        rows.append("今天有美国高影响数据或美联储相关事件，公布前后不要追涨追跌。")
+    rows.extend(
+        [
+            "价格在买入区和卖出区中间，没有便宜价也没有强势信号。",
+            "你看不懂为什么要买，只是因为价格在动。",
+            "已经连续亏损两次，当天停止交易。",
+        ]
+    )
+    return rows
+
+
+def rules_report(gold: Quote, dxy: Quote, tnx: Quote, news: list[str], calendar_events: list[CalendarEvent]) -> str:
     levels = build_levels(gold)
-    headline, action, probs, reasons, confidence = judge(gold, dxy, tnx)
+    headline, action, probs, reasons, confidence = judge(gold, dxy, tnx, news, calendar_events)
     today = now_cn().strftime("%Y-%m-%d %H:%M CST")
 
     gold_pct = pct(gold.change_24h, gold.value)
-    dxy_pct = pct(dxy.change_24h, dxy.value)
 
     news_text = "\n".join(f"- {item}" for item in news[:5]) if news else "- 暂未抓到可靠的近24小时新闻标题，需降低新闻面判断权重。"
     probs_text = "\n".join(f"- {k}：{v}%" for k, v in probs.items())
     checklist_text = "\n".join(build_market_checklist(gold, dxy, tnx))
-    reasons_text = "\n".join(f"- {reason}" for reason in reasons) if reasons else "- 当前没有单一变量给出强信号，按震荡处理。"
+    reasons_text = "\n".join(f"- {reason}" for reason in reasons) if reasons else "- 当前没有单一变量给出强信号，按方向不清楚处理。"
     data_quality = "完整" if not any(q.value is None for q in [gold, dxy, tnx]) else "部分缺失，需降低仓位和信心"
+    calendar_text = build_calendar_text(calendar_events)
+    entry_rule, target_rule, stop_rule = build_trade_rules(headline, levels, gold)
+    no_trade_text = "\n".join(f"- {item}" for item in build_no_trade_conditions(gold, calendar_events))
+    risk_flags = news_risk_flags(news)
+    news_risk_text = "、".join(risk_flags) if risk_flags else "暂未发现特别强的新闻风险词"
 
     return f"""# 每日黄金24小时交易判断
 
 时间：{today}
 标的：国际黄金，现货黄金/XAUUSD为主。
 
-## 先看结论
-- 未来24小时方向：{headline}
-- 今天操作建议：{action}
+## 1. 今天先看这一句
+- 能不能交易：{headline}
+- 我的建议：{action}
 - 判断信心：{confidence}
-- 新手原则：价格没到计划位置，不交易；到了位置但还没止住，也不交易。
+- 小白底线：没有到计划价格，不交易；到了计划价格但还在继续跌，也不交易。
 
-## 小白操作卡
-1. 只在两个位置考虑动手：跌到 {levels["support_near"]} 附近并止住，或涨过 {levels["resistance_near"]} 后站稳。
-2. 如果价格在中间晃，既不到买入区也不到卖出区，默认观望。
-3. 如果进场后跌破 {levels["support_key"]}，说明判断可能错了，先止损或离场，不硬扛。
+## 2. 今天怎么做
+- 入场规则：{entry_rule}
+- 目标/减仓：{target_rule}
+- 止损/认错：{stop_rule}
 
-## 现在市场在说什么
-- 黄金：{fmt(gold.value)} 美元/盎司附近，近24小时变化 {fmt(gold.change_24h)}，约 {fmt(gold_pct)}%。
+## 3. 哪些情况直接不做
+{no_trade_text}
+
+## 4. 现在市场数据
+- 黄金现价：{fmt(gold.value)} 美元/盎司
 - 金价更新时间：{fmt_time(gold.updated_at)}
-- 数据完整性：{data_quality}。
+- 近24小时变化：{fmt(gold.change_24h)} 美元，约 {fmt(gold_pct)}%
+- 数据完整性：{data_quality}
 {checklist_text}
 
-## 为什么这么判断
+## 5. 今天重要财经日历
+{calendar_text}
+
+## 6. 近24小时新闻线索
+- 新闻风险归纳：{news_risk_text}
+{news_text}
+
+## 7. 为什么这么判断
 {reasons_text}
 
-## 24小时概率判断
+## 8. 24小时概率判断
 {probs_text}
 
-## 关键价位怎么用
+## 9. 关键价位
 - 买入观察区：{levels["support_near"]}
 - 跌破就认错的位置：{levels["support_key"]}
 - 第一卖出/减仓区：{levels["resistance_near"]}
 - 第二卖出/减仓区：{levels["resistance_key"]}
 
-## 三种执行情景
-- 跌下来再买：价格回到 {levels["support_near"]} 后不再继续跌，再考虑小仓位买；先看 {levels["resistance_near"]} 能不能到。
-- 涨上去再跟：价格站上 {levels["resistance_near"]}，同时美元和美债没有明显反弹，再小仓位跟；目标看 {levels["resistance_key"]}。
-- 直接观望：价格在买入区和卖出区中间、重大数据公布前、或报告数据缺失时，不开新仓。
-
-## 风险控制
-- 新手仓位：单笔最多只让账户亏损 0.5%-1%。
+## 10. 风险控制
+- 新手仓位：单笔最多只让账户亏损 0.5% 到 1%。
 - 不加仓摊平亏损单；方向错了先退出。
 - 数据前后30分钟波动会放大，除非经验足够，否则不做追单。
 - 这份报告追求的是提高胜率和减少乱交易，不能保证每天盈利。
 
-## 近24小时新闻线索
-{news_text}
-
-## 小白词典
+## 11. 小白词典
 - 买入观察区：价格跌到这里，可能有人愿意买，但要看到“不再继续跌”才考虑。
 - 卖出/减仓区：价格涨到这里，可能有人开始卖，先把利润保护住。
 - 站稳：价格涨过某个位置后，没有马上跌回来。
 - 止损：承认这次判断错了，先保住本金。
 
-## 来源与备注
+## 12. 来源与备注
 - 行情源：{gold.source}；{dxy.source}；{tnx.source}
 - 新闻源：Google News RSS
+- 财经日历源：Yahoo Finance Economic Calendar
 - 若行情源限流或不可用，报告会标注“缺失”，并自动降低结论信心。
 
 免责声明：以上为市场信息整理和交易情景推演，不构成个性化投资建议。
@@ -388,6 +616,9 @@ def rules_report(gold: Quote, dxy: Quote, tnx: Quote, news: list[str]) -> str:
 
 
 def improve_with_openai(raw_report: str) -> str:
+    if (os.getenv("USE_OPENAI_POLISH") or "").strip().lower() != "true":
+        return raw_report
+
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return raw_report
@@ -457,7 +688,15 @@ def quote_to_dict(quote: Quote) -> dict[str, object]:
     }
 
 
-def archive_report(report: str, raw_report: str, gold: Quote, dxy: Quote, tnx: Quote, news: list[str]) -> None:
+def archive_report(
+    report: str,
+    raw_report: str,
+    gold: Quote,
+    dxy: Quote,
+    tnx: Quote,
+    news: list[str],
+    calendar_events: list[CalendarEvent],
+) -> None:
     generated_at = now_cn()
     date_key = generated_at.strftime("%Y-%m-%d")
     year = generated_at.strftime("%Y")
@@ -466,7 +705,7 @@ def archive_report(report: str, raw_report: str, gold: Quote, dxy: Quote, tnx: Q
     report_path.parent.mkdir(parents=True, exist_ok=True)
     data_path.parent.mkdir(parents=True, exist_ok=True)
 
-    headline, action, probs, reasons, confidence = judge(gold, dxy, tnx)
+    headline, action, probs, reasons, confidence = judge(gold, dxy, tnx, news, calendar_events)
     levels = build_levels(gold)
     snapshot = {
         "date": date_key,
@@ -487,6 +726,8 @@ def archive_report(report: str, raw_report: str, gold: Quote, dxy: Quote, tnx: Q
             "us10y": quote_to_dict(tnx),
         },
         "news": news,
+        "calendar_events": [calendar_to_dict(event) for event in calendar_events],
+        "news_risk_flags": news_risk_flags(news),
         "raw_report": raw_report,
         "final_report": report,
     }
@@ -565,9 +806,9 @@ def prediction_direction(snapshot: dict[str, object]) -> str:
     headline = str(prediction.get("headline") or "")
     action = str(prediction.get("action") or "")
     text = headline + " " + action
-    if "小涨" in text or "上涨" in text:
+    if "小涨" in text or "上涨" in text or "买入区" in text:
         return "看涨"
-    if "小跌" in text or "不利于金价上涨" in text:
+    if "小跌" in text or "下跌" in text or "不建议新买" in text or "不利于金价上涨" in text:
         return "看跌"
     return "观望"
 
@@ -638,6 +879,19 @@ def build_weekly_review() -> tuple[str, dict[str, object]]:
             pct_value = None
         actual = actual_direction(pct_value)
         result = accuracy_result(predicted, actual)
+        calendar_events = snapshot.get("calendar_events") or []
+        high_event_count = sum(
+            1
+            for event in calendar_events
+            if isinstance(event, dict) and event.get("importance") == "高"
+        )
+        risk_flags = snapshot.get("news_risk_flags") or []
+        risk_note = []
+        if high_event_count:
+            risk_note.append(f"{high_event_count}个高影响财经事件")
+        if isinstance(risk_flags, list) and risk_flags:
+            risk_note.append("新闻风险：" + "、".join(str(item) for item in risk_flags[:2]))
+        risk_text = "；".join(risk_note) if risk_note else "未记录明显事件风险"
 
         if result != "未统计":
             counted += 1
@@ -656,6 +910,7 @@ def build_weekly_review() -> tuple[str, dict[str, object]]:
                 "pct_change": pct_value,
                 "actual": actual,
                 "result": result,
+                "risk_text": risk_text,
             }
         )
 
@@ -664,7 +919,8 @@ def build_weekly_review() -> tuple[str, dict[str, object]]:
     row_text = "\n".join(
         (
             f"- {row['date']}：预测 {row['predicted']}；报告价 {fmt(row['start_value'])}；"
-            f"24小时后 {fmt(row['actual_value'])}；真实变化 {fmt(row['pct_change'])}%；结果 {row['result']}"
+            f"24小时后 {fmt(row['actual_value'])}；真实变化 {fmt(row['pct_change'])}%；"
+            f"结果 {row['result']}；当日风险：{row['risk_text']}"
         )
         for row in rows
     )
@@ -774,10 +1030,11 @@ def run_daily() -> None:
     dxy = fetch_best_quote("DX-Y.NYB", "US Dollar Index")
     tnx = fetch_best_quote("^TNX", "US 10Y Treasury Yield")
     news = fetch_news()
+    calendar_events = fetch_economic_calendar()
 
-    raw = rules_report(gold, dxy, tnx, news)
+    raw = rules_report(gold, dxy, tnx, news, calendar_events)
     report = sanitize_report(improve_with_openai(raw))
-    archive_report(report, raw, gold, dxy, tnx, news)
+    archive_report(report, raw, gold, dxy, tnx, news, calendar_events)
     send_serverchan("每日黄金24小时交易判断", report)
     print("Report sent through ServerChan.")
 
