@@ -93,6 +93,14 @@ def now_cn() -> datetime:
     return datetime.now(CN_TZ)
 
 
+def is_weekend_cn() -> bool:
+    return now_cn().weekday() in {5, 6}
+
+
+def is_market_closed() -> bool:
+    return is_weekend_cn()
+
+
 def http_get(url: str, *, timeout: int = 15) -> requests.Response:
     return requests.get(url, timeout=timeout, headers={"User-Agent": UA})
 
@@ -285,6 +293,34 @@ def first_usable_quote(quotes: list[Quote], *, require_recent: bool = False) -> 
     return fallback
 
 
+def quote_status_note(quote: Quote, *, label: str = "行情") -> str:
+    if quote.value is not None:
+        age = quote_age_minutes(quote)
+        if is_market_closed() and (age is None or age > 90):
+            return "周末休市，显示最近收盘价"
+        if age is not None and age > 90:
+            return "数据偏旧"
+        return "正常"
+
+    error = (quote.error or "").lower()
+    if is_market_closed():
+        return "周末休市，无新报价"
+    if "missing twelve_data_api_key" in error:
+        return "未配置 Twelve Data Key"
+    if "403" in error or "forbidden" in error:
+        return "数据源拒绝访问"
+    if "timed out" in error or "timeout" in error:
+        return "数据源超时"
+    return f"{label}暂不可用"
+
+
+def fmt_quote_value(quote: Quote, *, unit: str = "") -> str:
+    if quote.value is None:
+        return quote_status_note(quote)
+    suffix = f" {unit}" if unit else ""
+    return f"{fmt(quote.value)}{suffix}"
+
+
 def fetch_news() -> list[str]:
     query = urllib.parse.quote("gold price dollar yields Fed nonfarm payrolls when:1d")
     url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
@@ -342,6 +378,20 @@ def event_importance(event: str, country: str) -> str:
 
 
 def fetch_economic_calendar() -> list[CalendarEvent]:
+    if is_weekend_cn():
+        return [
+            CalendarEvent(
+                event="周末，通常没有主要美国财经数据",
+                country="US",
+                time_text="-",
+                period="-",
+                actual="-",
+                expected="-",
+                prior="-",
+                importance="低",
+            )
+        ]
+
     today = now_cn().strftime("%Y-%m-%d")
     url = f"https://finance.yahoo.com/calendar/economic?day={today}"
     try:
@@ -450,6 +500,10 @@ def build_market_context(gold: Quote, dxy: Quote, tnx: Quote, gld: Quote | None)
     notes = []
     usable_count = sum(1 for quote in quotes.values() if quote.value is not None)
     notes.append(f"后台参考数据共 {len(quotes)} 项，可用 {usable_count} 项。")
+    if is_market_closed():
+        notes.append("当前是周末休市时段，若没有新报价，属于正常市场状态。")
+    if not os.getenv("TWELVE_DATA_API_KEY"):
+        notes.append("Twelve Data Key未配置，美元指数、GLD、VIX等备用行情会受影响。")
     if quotes.get("real_10y") and quotes["real_10y"].value is not None:
         notes.append("已纳入实际利率，用来判断黄金中期压力。")
     if quotes.get("vix") and quotes["vix"].value is not None:
@@ -561,9 +615,15 @@ def build_driver_scores(
     gold_age = quote_age_minutes(gold)
     gold_pct = pct(gold.change_24h, gold.value)
     if gold.value is None:
-        rows.append(DriverScore("金价", "缺失", "不能判断", 0, 3, "没有最新金价时，不给交易建议。"))
+        if is_market_closed():
+            rows.append(DriverScore("金价", "周末休市，无新报价", "不能交易", 0, 2, "周末没有连续报价，等周一开盘后再判断。"))
+        else:
+            rows.append(DriverScore("金价", quote_status_note(gold, label="金价"), "不能判断", 0, 3, "没有最新金价时，不给交易建议。"))
     elif gold_age is None or gold_age > 90:
-        rows.append(DriverScore("金价", f"{fmt(gold.value)}，但数据偏旧", "风险升高", 0, 3, "价格不够新，点位可能已经失效。"))
+        if is_market_closed():
+            rows.append(DriverScore("金价", f"{fmt(gold.value)}，周末休市，最近收盘价", "不能交易", 0, 2, "周末价格不是实时跳动，不能按它制定新交易。"))
+        else:
+            rows.append(DriverScore("金价", f"{fmt(gold.value)}，但数据偏旧", "风险升高", 0, 3, "价格不够新，点位可能已经失效。"))
     elif gold_pct is None:
         rows.append(DriverScore("金价", f"{fmt(gold.value)}", "方向不明", 0, 1, "只能看到现价，看不到过去24小时变化。"))
     elif gold_pct >= 0.8:
@@ -579,7 +639,7 @@ def build_driver_scores(
 
     dxy_pct = pct(dxy.change_24h, dxy.value)
     if dxy.value is None:
-        rows.append(DriverScore("美元", "缺失", "不能判断", 0, 1, "美元是黄金的重要对手盘，缺失时信心下降。"))
+        rows.append(DriverScore("美元", quote_status_note(dxy, label="美元指数"), "不能判断", 0, 1, "美元是黄金的重要对手盘，缺失时信心下降。"))
     elif dxy_pct is None:
         rows.append(DriverScore("美元", f"{fmt(dxy.value)}", "方向不明", 0, 0, "只有美元现价，看不出短线变化。"))
     elif dxy_pct <= -0.3:
@@ -594,7 +654,7 @@ def build_driver_scores(
         rows.append(DriverScore("美元", f"近24小时 {fmt(dxy_pct)}%", "方向不明", 0, 0, "美元没有给出强方向。"))
 
     if tnx.value is None:
-        rows.append(DriverScore("美债收益率", "缺失", "不能判断", 0, 1, "利率数据缺失时，不能完整判断黄金压力。"))
+        rows.append(DriverScore("美债收益率", quote_status_note(tnx, label="美债收益率"), "不能判断", 0, 1, "利率数据缺失时，不能完整判断黄金压力。"))
     elif tnx.change_24h is None:
         rows.append(DriverScore("美债收益率", f"{fmt(tnx.value)}", "方向不明", 0, 0, "只有收益率现值，看不出短线变化。"))
     elif tnx.change_24h <= -0.06:
@@ -632,7 +692,7 @@ def build_driver_scores(
         else:
             rows.append(DriverScore("实际利率", f"{fmt(real_10y.value)}", "方向不明", 0, 0, "实际利率没有明显变化。"))
     elif real_10y:
-        rows.append(DriverScore("实际利率", "缺失", "不能判断", 0, 1, "实际利率缺失时，中期判断信心下降。"))
+        rows.append(DriverScore("实际利率", quote_status_note(real_10y, label="实际利率"), "不能判断", 0, 1, "实际利率缺失时，中期判断信心下降。"))
 
     gld = context_quotes.get("gld")
     if gld and gld.value is not None:
@@ -719,6 +779,20 @@ def judge(
     risk_flags = news_risk_flags(news)
     if risk_flags:
         reasons.append("新闻面出现风险线索：" + "、".join(risk_flags[:3]) + "。需要降低仓位或等待价格稳定。")
+
+    if is_market_closed() and (gold.value is None or gold_age is None or gold_age > 90):
+        return TradeDecision(
+            headline="C 只观察：周末休市，等开盘后再判断",
+            action="周末没有连续报价，不开新仓；等周一开盘后再看最新金价。",
+            probabilities={"周末休市，先观察": 80, "周一开盘后重新判断": 20},
+            reasons=reasons or ["当前是周末休市时段，缺少实时金价不等于行情异常。"],
+            confidence="低",
+            trade_grade="C",
+            trade_grade_text="只观察",
+            direction_score=direction_score,
+            risk_score=risk_score,
+            driver_scores=driver_scores,
+        )
 
     if direction_score >= 2:
         stance = "上涨机会更大"
@@ -901,6 +975,8 @@ def build_core_logic(decision: TradeDecision) -> str:
 
 
 def build_daily_view(decision: TradeDecision) -> str:
+    if "周末休市" in decision.headline:
+        return "周末休市，先观察"
     if decision.risk_score >= 3 and decision.trade_grade == "C":
         return "事件风险主导，先观察"
     if "上涨机会" in decision.headline:
@@ -911,7 +987,10 @@ def build_daily_view(decision: TradeDecision) -> str:
 
 
 def build_conclusion_table(decision: TradeDecision, core_logic: str) -> str:
-    max_risk = "今天有重要数据或新闻风险，价格可能突然大幅波动。" if decision.risk_score >= 2 else "暂未发现特别强的事件风险，但不能满仓。"
+    if "周末休市" in decision.headline:
+        max_risk = "周末没有连续报价，旧价格不能直接拿来交易。"
+    else:
+        max_risk = "今天有重要数据或新闻风险，价格可能突然大幅波动。" if decision.risk_score >= 2 else "暂未发现特别强的事件风险，但不能满仓。"
     return "\n".join(
         [
             "| 项目 | 今天的答案 | 小白解释 |",
@@ -975,20 +1054,29 @@ def build_market_snapshot(gold: Quote, dxy: Quote, tnx: Quote, gld: Quote | None
     rows = [
         "| 指标 | 当前/变化 | 用途 |",
         "| --- | --- | --- |",
-        f"| 国际黄金 | {fmt(gold.value)} 美元/盎司；24小时 {fmt(gold.change_24h)} 美元，约 {fmt(gold_pct)}% | 核心交易价格 |",
-        f"| 金价更新时间 | {fmt_time(gold.updated_at)} | 判断数据是否新 |",
-        f"| 美元指数 | {fmt(dxy.value)}；24小时 {fmt(dxy_pct)}% | 美元强通常压黄金 |",
-        f"| 美国10年期收益率 | {fmt(tnx.value)}；24小时 {fmt(tnx.change_24h)} | 利率上行通常压黄金 |",
+        f"| 国际黄金 | {fmt_quote_value(gold, unit='美元/盎司')}；24小时 {fmt(gold.change_24h)} 美元，约 {fmt(gold_pct)}% | 核心交易价格 |",
+        f"| 金价更新时间 | {fmt_time(gold.updated_at)}；{quote_status_note(gold, label='金价')} | 判断数据是否新 |",
+        f"| 美元指数 | {fmt_quote_value(dxy)}；24小时 {fmt(dxy_pct)}% | 美元强通常压黄金 |",
+        f"| 美国10年期收益率 | {fmt_quote_value(tnx)}；24小时 {fmt(tnx.change_24h)} | 利率上行通常压黄金 |",
     ]
     if gld is not None:
         gld_pct = pct(gld.change_24h, gld.value)
-        rows.append(f"| GLD黄金ETF | {fmt(gld.value)}；24小时 {fmt(gld_pct)}% | 海外黄金资金情绪 |")
-    data_quality = "完整" if not any(q.value is None for q in [gold, dxy, tnx]) else "部分缺失"
+        rows.append(f"| GLD黄金ETF | {fmt_quote_value(gld)}；24小时 {fmt(gld_pct)}% | 海外黄金资金情绪 |")
+    if is_market_closed() and gold.value is None:
+        data_quality = "周末休市，金价无新报价"
+    else:
+        data_quality = "完整" if not any(q.value is None for q in [gold, dxy, tnx]) else "部分缺失"
     rows.append(f"| 数据完整性 | {data_quality} | 缺失时降低仓位和信心 |")
     return "\n".join(rows)
 
 
 def build_trade_rules(decision: TradeDecision, levels: dict[str, str], gold: Quote) -> tuple[str, str, str]:
+    if is_market_closed() and (gold.value is None or quote_age_minutes(gold) is None or quote_age_minutes(gold) > 90):
+        return (
+            "不能交易：周末休市，没有连续报价。",
+            "等周一开盘后重新生成报告，再看是否有计划价格。",
+            "周末不设置新的止损和目标；已有仓位只复盘，不追加。",
+        )
     if gold.value is None:
         return (
             "不能交易：没有可用金价。",
@@ -1110,6 +1198,8 @@ def build_loss_traps(decision: TradeDecision, gold: Quote, events: list[Calendar
     ]
     if decision.trade_grade == "C":
         rows.insert(0, "报告已经给出只观察，但仍然强行开仓。")
+    if is_market_closed():
+        rows.insert(0, "周末休市还用旧价格做新决定。")
     if any(event.importance == "高" for event in events):
         rows.insert(0, "重要数据公布前后30分钟追涨追跌。")
     gold_age = quote_age_minutes(gold)
@@ -1121,6 +1211,8 @@ def build_loss_traps(decision: TradeDecision, gold: Quote, events: list[Calendar
 def build_no_trade_conditions(gold: Quote, events: list[CalendarEvent]) -> list[str]:
     rows = []
     gold_age = quote_age_minutes(gold)
+    if is_market_closed():
+        rows.append("周末休市，没有连续报价时不做新交易。")
     if gold_age is None or gold_age > 90:
         rows.append("金价不是90分钟内更新的数据。")
     if any(event.importance == "高" for event in events):
@@ -1332,6 +1424,7 @@ def quote_to_dict(quote: Quote) -> dict[str, object]:
         "source": quote.source,
         "updated_at": quote.updated_at.isoformat() if quote.updated_at else None,
         "error": quote.error,
+        "status_note": quote_status_note(quote, label=quote.name),
     }
 
 
@@ -1809,7 +1902,7 @@ def archive_weekly_review(review: str, payload: dict[str, object]) -> None:
 def fetch_best_quote(symbol: str, name: str) -> Quote:
     quote = fetch_yahoo_chart(symbol, name, range_="1d", interval="5m")
     age = quote_age_minutes(quote)
-    if quote.value is not None and age is not None and age <= 90:
+    if quote.value is not None and (is_market_closed() or (age is not None and age <= 90)):
         return quote
     fallback = fetch_yahoo_chart(symbol, name, range_="5d", interval="1h")
     if fallback.value is not None:
@@ -1835,12 +1928,12 @@ def fetch_best_market_quote(
 def fetch_best_gold_quote() -> Quote:
     quote = fetch_twelvedata_chart("XAU/USD", "Spot Gold")
     age = quote_age_minutes(quote)
-    if quote.value is not None and age is not None and age <= 90:
+    if quote.value is not None and (is_market_closed() or (age is not None and age <= 90)):
         return quote
 
     quote = fetch_best_quote("GC=F", "COMEX Gold Futures")
     age = quote_age_minutes(quote)
-    if quote.value is not None and age is not None and age <= 90:
+    if quote.value is not None and (is_market_closed() or (age is not None and age <= 90)):
         return quote
 
     spot = fetch_best_quote("XAUUSD=X", "Spot Gold")
