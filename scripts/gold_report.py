@@ -105,6 +105,12 @@ def http_get(url: str, *, timeout: int = 15) -> requests.Response:
     return requests.get(url, timeout=timeout, headers={"User-Agent": UA})
 
 
+def redact_secret_text(value: str) -> str:
+    value = re.sub(r"([?&](?:apikey|api_key|token|key)=)[^&\s]+", r"\1REDACTED", value, flags=re.I)
+    value = re.sub(r"(Bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1REDACTED", value, flags=re.I)
+    return value
+
+
 def fetch_yahoo_chart(symbol: str, name: str, *, range_: str = "1d", interval: str = "5m") -> Quote:
     encoded = urllib.parse.quote(symbol, safe="")
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded}?range={range_}&interval={interval}"
@@ -136,7 +142,7 @@ def fetch_yahoo_chart(symbol: str, name: str, *, range_: str = "1d", interval: s
             updated_at=datetime.fromtimestamp(latest_ts, tz=timezone.utc).astimezone(CN_TZ),
         )
     except Exception as exc:
-        return Quote(name=name, symbol=symbol, value=None, change_24h=None, high_24h=None, low_24h=None, source=url, error=str(exc))
+        return Quote(name=name, symbol=symbol, value=None, change_24h=None, high_24h=None, low_24h=None, source=url, error=redact_secret_text(str(exc)))
 
 
 def fetch_twelvedata_chart(symbol: str, name: str, *, interval: str = "5min") -> Quote:
@@ -189,7 +195,7 @@ def fetch_twelvedata_chart(symbol: str, name: str, *, interval: str = "5min") ->
             updated_at=latest_dt,
         )
     except Exception as exc:
-        return Quote(name=name, symbol=symbol, value=None, change_24h=None, high_24h=None, low_24h=None, source=url, error=str(exc))
+        return Quote(name=name, symbol=symbol, value=None, change_24h=None, high_24h=None, low_24h=None, source="Twelve Data time_series", error=redact_secret_text(str(exc)))
 
 
 def fetch_treasury_10y() -> Quote:
@@ -232,7 +238,7 @@ def fetch_treasury_10y() -> Quote:
             updated_at=latest_dt,
         )
     except Exception as exc:
-        return Quote(name="US 10Y Treasury Yield", symbol="10Y Treasury", value=None, change_24h=None, high_24h=None, low_24h=None, source=url, error=str(exc))
+        return Quote(name="US 10Y Treasury Yield", symbol="10Y Treasury", value=None, change_24h=None, high_24h=None, low_24h=None, source=url, error=redact_secret_text(str(exc)))
 
 
 def parse_fred_date(value: str) -> datetime:
@@ -276,7 +282,7 @@ def fetch_fred_series(series_id: str, name: str) -> Quote:
             updated_at=latest_dt,
         )
     except Exception as exc:
-        return Quote(name=name, symbol=series_id, value=None, change_24h=None, high_24h=None, low_24h=None, source=url, error=str(exc))
+        return Quote(name=name, symbol=series_id, value=None, change_24h=None, high_24h=None, low_24h=None, source=url, error=redact_secret_text(str(exc)))
 
 
 def first_usable_quote(quotes: list[Quote], *, require_recent: bool = False) -> Quote:
@@ -486,9 +492,9 @@ def build_market_context(gold: Quote, dxy: Quote, tnx: Quote, gld: Quote | None)
         "real_10y": lambda: fetch_fred_series("DFII10", "10Y Real Yield"),
         "fred_usd": lambda: fetch_fred_series("DTWEXBGS", "Broad US Dollar Index"),
         "fred_10y": lambda: fetch_fred_series("DGS10", "10Y Treasury Yield FRED"),
-        "vix": lambda: fetch_best_market_quote("^VIX", "VIX Volatility Index", twelvedata_symbols=["VIX"]),
+        "vix": lambda: fetch_best_market_quote("^VIX", "VIX Volatility Index / VIXY ETF proxy", twelvedata_symbols=["VIX", "VIXY"]),
         "sp500": lambda: fetch_best_market_quote("^GSPC", "S&P 500", twelvedata_symbols=["SPX", "SPY"]),
-        "silver": lambda: fetch_best_market_quote("SI=F", "Silver Futures", twelvedata_symbols=["XAG/USD", "XAGUSD"]),
+        "silver": lambda: fetch_best_market_quote("SI=F", "Silver Futures / SLV ETF proxy", twelvedata_symbols=["XAG/USD", "XAGUSD", "SLV"]),
     }
     for key, fetcher in extra_fetchers.items():
         try:
@@ -1943,7 +1949,13 @@ def fetch_best_gold_quote() -> Quote:
 
 
 def fetch_best_dxy_quote() -> Quote:
-    return fetch_best_market_quote("DX-Y.NYB", "US Dollar Index", twelvedata_symbols=["DXY", "USDOLLAR"])
+    quote = fetch_best_market_quote("DX-Y.NYB", "US Dollar Index", twelvedata_symbols=["DXY", "USDOLLAR"])
+    if quote.value is not None:
+        return quote
+    fred = fetch_fred_series("DTWEXBGS", "Broad US Dollar Index")
+    if fred.value is not None:
+        return fred
+    return quote
 
 
 def fetch_best_tnx_quote() -> Quote:
